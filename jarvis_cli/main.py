@@ -117,6 +117,7 @@ def show_help():
     jarvis-cli --enqueue "task" Add task to daemon queue
     jarvis-cli --daemon-status Show daemon status and queue
     jarvis-cli --clear-queue   Empty the task queue
+    jarvis-cli --replay        Replay last completed task's tool calls (animated)
 """)
 
 
@@ -495,6 +496,194 @@ def _format_elapsed_time(elapsed_seconds):
         return f"{hours}h{minutes}m"
 
 
+def _format_tool_input(name, inp):
+    """Format tool input for replay display."""
+    if name == "file_write":
+        path = inp.get("path", "")
+        content = inp.get("content", "")
+        lines = content.count("\n") + 1
+        preview = content[:100].replace("\n", "\\n") + ("..." if len(content) > 100 else "")
+        return f"path='{path}' content='{preview}' ({lines} lines)"
+    elif name == "file_patch":
+        path = inp.get("path", "")
+        old = inp.get("old_str", "")[:30].replace("\n", "\\n")
+        new = inp.get("new_str", "")[:30].replace("\n", "\\n")
+        return f"path='{path}' old='{old}...' new='{new}...'"
+    elif name == "execute_bash":
+        cmd = inp.get("command", "")
+        wd = inp.get("working_dir", "")
+        wd_str = f" (in {wd})" if wd else ""
+        return f"command='{cmd}'{wd_str}"
+    elif name == "file_read":
+        path = inp.get("path", "")
+        limit = inp.get("limit", "")
+        offset = inp.get("offset", "")
+        extras = []
+        if limit: extras.append(f"limit={limit}")
+        if offset: extras.append(f"offset={offset}")
+        extra_str = f" {' '.join(extras)}" if extras else ""
+        return f"path='{path}'{extra_str}"
+    elif name == "list_directory":
+        path = inp.get("path", "")
+        depth = inp.get("depth", 1)
+        return f"path='{path}' depth={depth}"
+    elif name == "glob_search":
+        pattern = inp.get("pattern", "")
+        path = inp.get("path", "")
+        path_str = f" in {path}" if path else ""
+        return f"pattern='{pattern}'{path_str}"
+    elif name == "grep_search":
+        pattern = inp.get("pattern", "")
+        path = inp.get("path", "")
+        include = inp.get("include", "")
+        parts = [f"pattern='/{pattern}/'"]
+        if path: parts.append(f"path='{path}'")
+        if include: parts.append(f"include='{include}'")
+        return " ".join(parts)
+    elif name == "web_search":
+        query = inp.get("query", "")
+        return f"query='{query}'"
+    elif name == "web_fetch":
+        url = inp.get("url", "")
+        return f"url='{url}'"
+    elif name == "symbol_search":
+        name_arg = inp.get("name", "")
+        path = inp.get("path", "")
+        path_str = f" in {path}" if path else ""
+        return f"name='{name_arg}'{path_str}"
+    elif name == "git":
+        args = inp.get("args", "")
+        wd = inp.get("working_dir", "")
+        wd_str = f" (in {wd})" if wd else ""
+        return f"args='{args}'{wd_str}"
+    elif name == "dev_pipeline":
+        action = inp.get("action", "")
+        branch = inp.get("branch", "")
+        parts = [f"action='{action}'", f"branch='{branch}'"]
+        if inp.get("message"): parts.append(f"message='{inp['message']}'")
+        if inp.get("test_command"): parts.append(f"test_command='{inp['test_command']}'")
+        if inp.get("target_branch"): parts.append(f"target_branch='{inp['target_branch']}'")
+        return " ".join(parts)
+    elif name == "synthesize":
+        question = inp.get("question", "")[:60]
+        return f"question='{question}...'"
+    elif name == "auto_fix":
+        command = inp.get("command", "")
+        wd = inp.get("working_dir", "")
+        wd_str = f" (in {wd})" if wd else ""
+        return f"command='{command}'{wd_str}"
+    elif name == "clipboard_paste":
+        text = inp.get("text", "")[:40]
+        paste = inp.get("paste", False)
+        paste_str = " +paste" if paste else ""
+        return f"text='{text}...'{paste_str}"
+    else:
+        # Generic fallback
+        return str(inp)[:80]
+
+
+def _format_tool_result(result):
+    """Format tool result for replay display."""
+    if not result:
+        return f"{DIM}(no output){RESET}"
+    
+    # Truncate very long results
+    if len(result) > 200:
+        preview = result[:200].replace("\n", "↵")
+        return f"{DIM}{preview}...{RESET}"
+    else:
+        preview = result.replace("\n", "↵")
+        return f"{DIM}{preview}{RESET}"
+
+
+def replay_last_task():
+    """Replay the last completed task's tool calls as an animated demo."""
+    if not COMPLETED_FILE.exists():
+        print(f"  {YELLOW}No completed tasks found{RESET}")
+        return
+    
+    try:
+        completed = json.loads(COMPLETED_FILE.read_text())
+    except (json.JSONDecodeError, FileNotFoundError):
+        print(f"  {YELLOW}No completed tasks found{RESET}")
+        return
+    
+    if not completed:
+        print(f"  {YELLOW}No completed tasks found{RESET}")
+        return
+    
+    # Find the last successful task with tool calls
+    last_task = None
+    for task in reversed(completed):
+        if task.get("status") == "completed" and task.get("tool_calls"):
+            last_task = task
+            break
+    
+    if not last_task:
+        print(f"  {YELLOW}No completed tasks with tool calls found{RESET}")
+        return
+    
+    tool_calls = last_task.get("tool_calls", [])
+    if not tool_calls:
+        print(f"  {YELLOW}Last task has no tool calls to replay{RESET}")
+        return
+    
+    # Show replay header
+    task_preview = last_task.get("task", "")[:60] + ("..." if len(last_task.get("task", "")) > 60 else "")
+    completed_time = datetime.fromisoformat(last_task["completed_at"]).strftime("%m/%d %H:%M:%S")
+    elapsed_time = last_task.get("elapsed_time")
+    elapsed_str = f" ({_format_elapsed_time(elapsed_time)})" if elapsed_time else ""
+    
+    print(f"""
+  {CYAN}╭{'─' * 70}╮{RESET}
+  {CYAN}│{RESET} {BOLD}Jarvis CLI — Replay Mode{RESET}                                     {CYAN}│{RESET}
+  {CYAN}╰{'─' * 70}╯{RESET}
+
+  {GREEN}Replaying:{RESET} {task_preview}
+  {GREEN}Completed:{RESET} {completed_time}{elapsed_str}
+  {GREEN}Tool calls:{RESET} {len(tool_calls)}
+
+  {DIM}Press Ctrl+C to stop replay{RESET}
+""")
+    
+    try:
+        for i, tool_call in enumerate(tool_calls, 1):
+            name = tool_call.get("name", "unknown")
+            inp = tool_call.get("input", {})
+            result = tool_call.get("result", "")
+            
+            # Show tool call step
+            print(f"  {CYAN}[{i}/{len(tool_calls)}]{RESET} {MAGENTA}⚡ {name}{RESET}")
+            
+            # Show formatted input
+            formatted_input = _format_tool_input(name, inp)
+            print(f"  {DIM}    {formatted_input}{RESET}")
+            
+            # Delay before showing result
+            time.sleep(0.5)
+            
+            # Show result preview
+            formatted_result = _format_tool_result(result)
+            print(f"  {GREEN}    → {formatted_result}{RESET}")
+            
+            # Delay before next step
+            if i < len(tool_calls):  # Don't delay after last step
+                time.sleep(0.5)
+                print()  # Add spacing between steps
+        
+        print(f"""
+  {GREEN}✓ Replay complete{RESET}
+  {DIM}Run 'jarvis-cli --status' to see more completed tasks{RESET}
+""")
+        
+    except KeyboardInterrupt:
+        print(f"""
+
+  {YELLOW}⏹ Replay stopped{RESET}
+""")
+        return
+
+
 def enqueue_task(task):
     """Add a task to the daemon queue."""
     # Ensure directory exists
@@ -542,7 +731,7 @@ def save_queue(queue):
     QUEUE_FILE.write_text(json.dumps(queue, indent=2))
 
 
-def log_completed_task(task_entry, response, error=None, elapsed_time=None):
+def log_completed_task(task_entry, response, error=None, elapsed_time=None, tool_calls=None):
     """Log a completed task to completed.json."""
     COMPLETED_FILE.parent.mkdir(parents=True, exist_ok=True)
     
@@ -559,6 +748,7 @@ def log_completed_task(task_entry, response, error=None, elapsed_time=None):
         "response": response,
         "error": error,
         "elapsed_time": elapsed_time,
+        "tool_calls": tool_calls or [],
         "status": "completed" if not error else "failed"
     }
     
@@ -579,7 +769,7 @@ def execute_task(task):
     if local_mode:
         api_key = _get_local_key()
         if not api_key:
-            return None, "ANTHROPIC_API_KEY not set", 0
+            return None, "ANTHROPIC_API_KEY not set", 0, []
         
         # Import and run agent
         sys.path.insert(0, str(AGENT_BACKEND))
@@ -599,10 +789,11 @@ def execute_task(task):
 
             result = asyncio.run(run_agent(task, api_key, on_event=on_event))
             elapsed_time = time.time() - start_time
-            return result.get("response", ""), None, elapsed_time
+            tool_calls = result.get("tool_calls", [])
+            return result.get("response", ""), None, elapsed_time, tool_calls
         except Exception as e:
             elapsed_time = time.time() - start_time
-            return None, str(e), elapsed_time
+            return None, str(e), elapsed_time, []
     else:
         # Use API
         import urllib.request
@@ -617,10 +808,11 @@ def execute_task(task):
             with urllib.request.urlopen(req, timeout=300) as resp:
                 result = json.loads(resp.read())
             elapsed_time = time.time() - start_time
-            return result.get("response", ""), None, elapsed_time
+            tool_calls = result.get("tool_calls", [])
+            return result.get("response", ""), None, elapsed_time, tool_calls
         except Exception as e:
             elapsed_time = time.time() - start_time
-            return None, str(e), elapsed_time
+            return None, str(e), elapsed_time, []
 
 
 def status():
@@ -906,12 +1098,12 @@ def daemon_mode():
                     save_queue(queue)
                     
                     # Execute the task
-                    response, error, elapsed_time = execute_task(task)
+                    response, error, elapsed_time, tool_calls = execute_task(task)
                     
                     # Remove from queue and log completion
                     queue = [t for t in queue if t["id"] != task_id]
                     save_queue(queue)
-                    log_completed_task(task_entry, response, error, elapsed_time)
+                    log_completed_task(task_entry, response, error, elapsed_time, tool_calls)
                     
                     elapsed_str = _format_elapsed_time(elapsed_time)
                     if error:
@@ -957,6 +1149,8 @@ def main():
         daemon_status()
     elif args[0] == "--clear-queue":
         clear_queue()
+    elif args[0] == "--replay":
+        replay_last_task()
     elif args[0] == "--enqueue":
         if len(args) < 2:
             print(f"  {YELLOW}Usage: jarvis-cli --enqueue \"task description\"{RESET}")
