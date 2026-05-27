@@ -20,6 +20,8 @@ import readline
 import signal
 import threading
 import uuid
+import ast
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -57,6 +59,7 @@ CAPABILITIES = {
     "file_patch": "Edit files by replacing specific strings (safe partial edits)",
     "git": "Git operations (status, diff, log, add, commit, branch)",
     "dev_pipeline": "Full dev cycle (branch → commit → test → merge → cleanup)",
+    "codebase_index": "Build JSON map of files, functions, and classes",
 }
 
 BACKLOG = [
@@ -65,7 +68,7 @@ BACKLOG = [
     "test runner tool (run tests, parse failures)",
     "image/screenshot analysis tool",
     "database query tool (read-only SQL)",
-    "codebase indexing (semantic search over project)",
+    "semantic search over codebase indexes (embedding-based)",
     "multi-file refactor (rename across codebase)",
 ]
 
@@ -118,6 +121,8 @@ def show_help():
     jarvis-cli --daemon-status Show daemon status and queue
     jarvis-cli --clear-queue   Empty the task queue
     jarvis-cli --replay        Replay last completed task's tool calls (animated)
+    jarvis-cli --index <dir>   Build codebase index for directory
+    jarvis-cli --index-force <dir> Force rebuild codebase index
 """)
 
 
@@ -1024,6 +1029,233 @@ def _next_idle_task():
     return None
 
 
+def _extract_python_definitions(file_path):
+    """Extract function and class definitions from a Python file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        tree = ast.parse(content)
+        definitions = []
+        
+        # Only process top-level nodes to avoid duplicating class methods
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
+                definitions.append({
+                    "type": "function",
+                    "name": node.name,
+                    "line": node.lineno,
+                    "docstring": ast.get_docstring(node),
+                    "args": [arg.arg for arg in node.args.args]
+                })
+            elif isinstance(node, ast.ClassDef):
+                # Get class methods
+                methods = []
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        methods.append({
+                            "name": item.name,
+                            "line": item.lineno,
+                            "docstring": ast.get_docstring(item),
+                            "args": [arg.arg for arg in item.args.args]
+                        })
+                
+                definitions.append({
+                    "type": "class",
+                    "name": node.name,
+                    "line": node.lineno,
+                    "docstring": ast.get_docstring(node),
+                    "methods": methods
+                })
+        
+        return definitions
+    except (SyntaxError, UnicodeDecodeError, FileNotFoundError):
+        return []
+
+
+def _extract_javascript_definitions(file_path):
+    """Extract function and class definitions from JavaScript/TypeScript files using simple regex."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        definitions = []
+        lines = content.split('\n')
+        
+        for i, line in enumerate(lines, 1):
+            line = line.strip()
+            
+            # Function declarations: function name() {}
+            if line.startswith('function ') and '(' in line:
+                func_name = line.split('function ')[1].split('(')[0].strip()
+                if func_name:
+                    definitions.append({
+                        "type": "function",
+                        "name": func_name,
+                        "line": i
+                    })
+            
+            # Arrow functions: const name = () => {}
+            elif ' = (' in line and '=>' in line:
+                if line.startswith(('const ', 'let ', 'var ', 'export const ')):
+                    func_name = line.split(' = (')[0].split()[-1]
+                    if func_name:
+                        definitions.append({
+                            "type": "function",
+                            "name": func_name,
+                            "line": i
+                        })
+            
+            # Class declarations: class Name {}
+            elif line.startswith(('class ', 'export class ')):
+                class_name = line.split('class ')[1].split()[0].strip('{')
+                if class_name:
+                    definitions.append({
+                        "type": "class",
+                        "name": class_name,
+                        "line": i
+                    })
+        
+        return definitions
+    except (UnicodeDecodeError, FileNotFoundError):
+        return []
+
+
+def _should_index_file(file_path):
+    """Check if a file should be included in the index."""
+    path = Path(file_path)
+    
+    # Skip hidden files and directories
+    if any(part.startswith('.') for part in path.parts):
+        return False
+    
+    # Skip common build/cache directories
+    skip_dirs = {
+        'node_modules', '__pycache__', '.git', 'build', 'dist', 
+        'target', 'venv', '.venv', 'env', '.env', 'coverage',
+        '.pytest_cache', '.mypy_cache', '.tox'
+    }
+    if any(part in skip_dirs for part in path.parts):
+        return False
+    
+    # Only index code files
+    code_extensions = {
+        '.py', '.js', '.ts', '.jsx', '.tsx', '.go', '.rs', '.java',
+        '.cpp', '.c', '.h', '.hpp', '.php', '.rb', '.swift', '.kt'
+    }
+    return path.suffix.lower() in code_extensions
+
+
+def _get_file_hash(file_path):
+    """Get MD5 hash of file content to detect changes."""
+    try:
+        with open(file_path, 'rb') as f:
+            return hashlib.md5(f.read()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def codebase_index(directory_path, force_rebuild=False):
+    """Build a JSON map of all files, functions, and classes in a directory."""
+    directory_path = Path(directory_path).expanduser().resolve()
+    
+    if not directory_path.exists():
+        return {"error": f"Directory not found: {directory_path}"}
+    
+    # Create index filename based on directory path
+    dir_hash = hashlib.md5(str(directory_path).encode()).hexdigest()[:12]
+    index_name = f"{directory_path.name}_{dir_hash}.json"
+    index_file = Path.home() / ".jarvis_cli" / "indexes" / index_name
+    
+    # Load existing index if available
+    existing_index = {}
+    if index_file.exists() and not force_rebuild:
+        try:
+            existing_index = json.loads(index_file.read_text())
+        except (json.JSONDecodeError, FileNotFoundError):
+            existing_index = {}
+    
+    print(f"  {CYAN}📂 Indexing codebase:{RESET} {directory_path}")
+    
+    # Build file list
+    files_to_process = []
+    for file_path in directory_path.rglob('*'):
+        if file_path.is_file() and _should_index_file(file_path):
+            files_to_process.append(file_path)
+    
+    print(f"  {DIM}Found {len(files_to_process)} code files{RESET}")
+    
+    index = {
+        "metadata": {
+            "directory": str(directory_path),
+            "indexed_at": datetime.now().isoformat(),
+            "file_count": len(files_to_process),
+            "jarvis_cli_version": "1.0"
+        },
+        "files": {}
+    }
+    
+    processed = 0
+    for file_path in files_to_process:
+        rel_path = str(file_path.relative_to(directory_path))
+        
+        # Check if file changed since last index
+        current_hash = _get_file_hash(file_path)
+        if (not force_rebuild and rel_path in existing_index.get("files", {}) and 
+            existing_index["files"][rel_path].get("hash") == current_hash):
+            # File unchanged, copy existing data
+            index["files"][rel_path] = existing_index["files"][rel_path]
+            processed += 1
+            continue
+        
+        # Process the file
+        file_info = {
+            "path": rel_path,
+            "absolute_path": str(file_path),
+            "hash": current_hash,
+            "size": file_path.stat().st_size,
+            "modified_at": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
+            "definitions": []
+        }
+        
+        # Extract definitions based on file type
+        if file_path.suffix == '.py':
+            file_info["definitions"] = _extract_python_definitions(file_path)
+        elif file_path.suffix in {'.js', '.ts', '.jsx', '.tsx'}:
+            file_info["definitions"] = _extract_javascript_definitions(file_path)
+        
+        index["files"][rel_path] = file_info
+        processed += 1
+        
+        # Show progress for large codebases
+        if processed % 50 == 0:
+            print(f"  {DIM}  Processed {processed}/{len(files_to_process)} files...{RESET}")
+    
+    # Save index
+    index_file.parent.mkdir(parents=True, exist_ok=True)
+    index_file.write_text(json.dumps(index, indent=2))
+    
+    # Generate summary stats
+    total_functions = sum(len([d for d in file_info["definitions"] if d["type"] == "function"]) 
+                         for file_info in index["files"].values())
+    total_classes = sum(len([d for d in file_info["definitions"] if d["type"] == "class"]) 
+                       for file_info in index["files"].values())
+    
+    print(f"""  {GREEN}✓ Index complete:{RESET}
+    📁 Files: {len(files_to_process)}
+    🔧 Functions: {total_functions}
+    📦 Classes: {total_classes}
+    💾 Saved: {DIM}~/.jarvis_cli/indexes/{index_name}{RESET}""")
+    
+    return {
+        "index_file": str(index_file),
+        "files": len(files_to_process),
+        "functions": total_functions,
+        "classes": total_classes,
+        "directory": str(directory_path)
+    }
+
+
 def daemon_mode():
     """Start daemon mode - polls queue and executes tasks."""
     # Check if already running
@@ -1161,6 +1393,18 @@ def main():
             return
         task = " ".join(args[1:])
         enqueue_task(task)
+    elif args[0] == "--index":
+        if len(args) < 2:
+            print(f"  {YELLOW}Usage: jarvis-cli --index <directory>{RESET}")
+            return
+        directory = args[1]
+        codebase_index(directory)
+    elif args[0] == "--index-force":
+        if len(args) < 2:
+            print(f"  {YELLOW}Usage: jarvis-cli --index-force <directory>{RESET}")
+            return
+        directory = args[1]
+        codebase_index(directory, force_rebuild=True)
     else:
         # One-shot
         import urllib.request
