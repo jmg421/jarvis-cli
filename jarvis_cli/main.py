@@ -973,7 +973,11 @@ def daemon_status():
                 for task in recent:
                     status_icon = "✅" if task.get("status") == "completed" else "❌"
                     task_preview = task.get("task", "")[:45] + "..." if len(task.get("task", "")) > 45 else task.get("task", "")
-                    completed_time = datetime.fromisoformat(task["completed_at"]).strftime("%H:%M:%S")
+                    completed_at = task.get("completed_at")
+                    if completed_at:
+                        completed_time = datetime.fromisoformat(completed_at).strftime("%H:%M:%S")
+                    else:
+                        completed_time = "unknown"
                     elapsed_time = task.get("elapsed_time")
                     elapsed_str = f" ({_format_elapsed_time(elapsed_time)})" if elapsed_time else ""
                     print(f"    {status_icon} {completed_time}{elapsed_str} {DIM}{task_preview}{RESET}")
