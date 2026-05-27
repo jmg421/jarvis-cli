@@ -60,6 +60,8 @@ CAPABILITIES = {
     "git": "Git operations (status, diff, log, add, commit, branch)",
     "dev_pipeline": "Full dev cycle (branch → commit → test → merge → cleanup)",
     "codebase_index": "Build JSON map of files, functions, and classes",
+    "qpu_submit": "Submit quantum circuits to IonQ/AWS Braket QPUs",
+    "qpu_poll": "Poll QPU job status and retrieve results",
 }
 
 BACKLOG = [
