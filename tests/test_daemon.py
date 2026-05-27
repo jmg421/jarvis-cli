@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from jarvis_cli.main import (
     enqueue_task, load_queue, save_queue, log_completed_task,
-    daemon_status, QUEUE_FILE, COMPLETED_FILE, DAEMON_PID_FILE
+    daemon_status, _format_elapsed_time, QUEUE_FILE, COMPLETED_FILE, DAEMON_PID_FILE
 )
 
 
@@ -100,7 +100,8 @@ def test_log_completed_task(temp_config_dir, monkeypatch):
     }
     
     response = "Task completed successfully"
-    log_completed_task(task_entry, response)
+    elapsed_time = 5.5  # 5.5 seconds
+    log_completed_task(task_entry, response, elapsed_time=elapsed_time)
     
     # Check the completed file was created
     assert completed_file.exists()
@@ -111,6 +112,7 @@ def test_log_completed_task(temp_config_dir, monkeypatch):
     assert completed[0]["task"] == task_entry["task"]
     assert completed[0]["response"] == response
     assert completed[0]["status"] == "completed"
+    assert completed[0]["elapsed_time"] == elapsed_time
     assert "completed_at" in completed[0]
     
 
@@ -127,13 +129,15 @@ def test_log_failed_task(temp_config_dir, monkeypatch):
     }
     
     error = "Task failed with error"
-    log_completed_task(task_entry, None, error)
+    elapsed_time = 2.3  # 2.3 seconds
+    log_completed_task(task_entry, None, error, elapsed_time)
     
     # Check the task was logged as failed
     completed = json.loads(completed_file.read_text())
     assert len(completed) == 1
     assert completed[0]["error"] == error
     assert completed[0]["status"] == "failed"
+    assert completed[0]["elapsed_time"] == elapsed_time
 
 
 @patch('jarvis_cli.main.os.kill')
@@ -206,6 +210,28 @@ def test_queue_with_tasks(temp_config_dir, monkeypatch, capsys):
     assert "📝 Queued: 1" in captured.out
     assert "⚡ Processing: 1" in captured.out
     assert "first task" in captured.out
+
+
+def test_format_elapsed_time():
+    """Test the elapsed time formatting function."""
+    # Test milliseconds
+    assert _format_elapsed_time(0.5) == "500ms"
+    assert _format_elapsed_time(0.123) == "123ms"
+    
+    # Test seconds
+    assert _format_elapsed_time(1.0) == "1.0s"
+    assert _format_elapsed_time(5.7) == "5.7s"
+    assert _format_elapsed_time(59.9) == "59.9s"
+    
+    # Test minutes
+    assert _format_elapsed_time(60) == "1m0s"
+    assert _format_elapsed_time(125) == "2m5s"
+    assert _format_elapsed_time(3599) == "59m59s"
+    
+    # Test hours
+    assert _format_elapsed_time(3600) == "1h0m"
+    assert _format_elapsed_time(3665) == "1h1m"
+    assert _format_elapsed_time(7325) == "2h2m"
 
 
 if __name__ == "__main__":

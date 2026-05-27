@@ -478,6 +478,22 @@ def _summarize_tc(tc):
     return _summarize_input(tc.get("name", ""), tc.get("input", {}))
 
 
+def _format_elapsed_time(elapsed_seconds):
+    """Format elapsed time in a human-readable way."""
+    if elapsed_seconds < 1:
+        return f"{elapsed_seconds*1000:.0f}ms"
+    elif elapsed_seconds < 60:
+        return f"{elapsed_seconds:.1f}s"
+    elif elapsed_seconds < 3600:
+        minutes = int(elapsed_seconds // 60)
+        seconds = int(elapsed_seconds % 60)
+        return f"{minutes}m{seconds}s"
+    else:
+        hours = int(elapsed_seconds // 3600)
+        minutes = int((elapsed_seconds % 3600) // 60)
+        return f"{hours}h{minutes}m"
+
+
 def enqueue_task(task):
     """Add a task to the daemon queue."""
     # Ensure directory exists
@@ -525,7 +541,7 @@ def save_queue(queue):
     QUEUE_FILE.write_text(json.dumps(queue, indent=2))
 
 
-def log_completed_task(task_entry, response, error=None):
+def log_completed_task(task_entry, response, error=None, elapsed_time=None):
     """Log a completed task to completed.json."""
     COMPLETED_FILE.parent.mkdir(parents=True, exist_ok=True)
     
@@ -541,6 +557,7 @@ def log_completed_task(task_entry, response, error=None):
         "completed_at": datetime.now().isoformat(),
         "response": response,
         "error": error,
+        "elapsed_time": elapsed_time,
         "status": "completed" if not error else "failed"
     }
     
@@ -555,12 +572,13 @@ def log_completed_task(task_entry, response, error=None):
 
 def execute_task(task):
     """Execute a single task using the agent."""
+    start_time = time.time()
     local_mode = not _api_reachable()
     
     if local_mode:
         api_key = _get_local_key()
         if not api_key:
-            return None, "ANTHROPIC_API_KEY not set"
+            return None, "ANTHROPIC_API_KEY not set", 0
         
         # Import and run agent
         sys.path.insert(0, str(AGENT_BACKEND))
@@ -579,9 +597,11 @@ def execute_task(task):
                     print(f"    {DIM}→ {preview}{RESET}")
 
             result = asyncio.run(run_agent(task, api_key, on_event=on_event))
-            return result.get("response", ""), None
+            elapsed_time = time.time() - start_time
+            return result.get("response", ""), None, elapsed_time
         except Exception as e:
-            return None, str(e)
+            elapsed_time = time.time() - start_time
+            return None, str(e), elapsed_time
     else:
         # Use API
         import urllib.request
@@ -595,9 +615,11 @@ def execute_task(task):
             )
             with urllib.request.urlopen(req, timeout=300) as resp:
                 result = json.loads(resp.read())
-            return result.get("response", ""), None
+            elapsed_time = time.time() - start_time
+            return result.get("response", ""), None, elapsed_time
         except Exception as e:
-            return None, str(e)
+            elapsed_time = time.time() - start_time
+            return None, str(e), elapsed_time
 
 
 def status():
@@ -633,9 +655,11 @@ def status():
             if recent:
                 for i, task in enumerate(recent, 1):
                     status_icon = "✅" if task.get("status") == "completed" else "❌"
-                    task_preview = task.get("task", "")[:50] + "..." if len(task.get("task", "")) > 50 else task.get("task", "")
+                    task_preview = task.get("task", "")[:45] + "..." if len(task.get("task", "")) > 45 else task.get("task", "")
                     completed_time = datetime.fromisoformat(task["completed_at"]).strftime("%m/%d %H:%M")
-                    print(f"    {i}. {status_icon} {completed_time} {DIM}{task_preview}{RESET}")
+                    elapsed_time = task.get("elapsed_time")
+                    elapsed_str = f" ({_format_elapsed_time(elapsed_time)})" if elapsed_time else ""
+                    print(f"    {i}. {status_icon} {completed_time}{elapsed_str} {DIM}{task_preview}{RESET}")
             else:
                 print(f"    {DIM}No completed tasks yet{RESET}")
         except (json.JSONDecodeError, ValueError):
@@ -706,9 +730,11 @@ def daemon_status():
   {GREEN}Recent completions:{RESET}""")
                 for task in recent:
                     status_icon = "✅" if task.get("status") == "completed" else "❌"
-                    task_preview = task.get("task", "")[:50] + "..." if len(task.get("task", "")) > 50 else task.get("task", "")
+                    task_preview = task.get("task", "")[:45] + "..." if len(task.get("task", "")) > 45 else task.get("task", "")
                     completed_time = datetime.fromisoformat(task["completed_at"]).strftime("%H:%M:%S")
-                    print(f"    {status_icon} {completed_time} {DIM}{task_preview}{RESET}")
+                    elapsed_time = task.get("elapsed_time")
+                    elapsed_str = f" ({_format_elapsed_time(elapsed_time)})" if elapsed_time else ""
+                    print(f"    {status_icon} {completed_time}{elapsed_str} {DIM}{task_preview}{RESET}")
         except (json.JSONDecodeError, ValueError):
             pass
     
@@ -830,17 +856,18 @@ def daemon_mode():
                     save_queue(queue)
                     
                     # Execute the task
-                    response, error = execute_task(task)
+                    response, error, elapsed_time = execute_task(task)
                     
                     # Remove from queue and log completion
                     queue = [t for t in queue if t["id"] != task_id]
                     save_queue(queue)
-                    log_completed_task(task_entry, response, error)
+                    log_completed_task(task_entry, response, error, elapsed_time)
                     
+                    elapsed_str = _format_elapsed_time(elapsed_time)
                     if error:
-                        print(f"  {YELLOW}❌ Failed:{RESET} {error}")
+                        print(f"  {YELLOW}❌ Failed ({elapsed_str}):{RESET} {error}")
                     else:
-                        print(f"  {GREEN}✅ Completed{RESET}")
+                        print(f"  {GREEN}✅ Completed ({elapsed_str}){RESET}")
                         if response:
                             # Show first few lines of response
                             lines = response.split('\n')[:3]
