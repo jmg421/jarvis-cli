@@ -116,6 +116,7 @@ def show_help():
     jarvis-cli --daemon        Start daemon mode (polls queue, executes tasks)
     jarvis-cli --enqueue "task" Add task to daemon queue
     jarvis-cli --daemon-status Show daemon status and queue
+    jarvis-cli --clear-queue   Empty the task queue
 """)
 
 
@@ -685,6 +686,55 @@ def status():
     print()
 
 
+def clear_queue():
+    """Clear all tasks from the queue."""
+    queue = load_queue()
+    queued_count = len([t for t in queue if t.get("status") == "queued"])
+    processing_count = len([t for t in queue if t.get("status") == "processing"])
+    total_count = len(queue)
+    
+    if total_count == 0:
+        print(f"  {DIM}Queue is already empty{RESET}")
+        return
+    
+    # Save current queue as backup in completed.json for audit trail
+    if queue:
+        COMPLETED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        completed = []
+        if COMPLETED_FILE.exists():
+            try:
+                completed = json.loads(COMPLETED_FILE.read_text())
+            except (json.JSONDecodeError, FileNotFoundError):
+                completed = []
+        
+        # Mark cleared tasks as cancelled in completed log
+        for task in queue:
+            if task.get("status") in ("queued", "processing"):
+                cancelled_entry = {
+                    **task,
+                    "cancelled_at": datetime.now().isoformat(),
+                    "status": "cancelled",
+                    "reason": "queue cleared"
+                }
+                completed.append(cancelled_entry)
+        
+        # Keep only last 1000 completed tasks
+        if len(completed) > 1000:
+            completed = completed[-1000:]
+        
+        COMPLETED_FILE.write_text(json.dumps(completed, indent=2))
+    
+    # Clear the queue
+    save_queue([])
+    
+    print(f"  {GREEN}✓ Queue cleared:{RESET}")
+    print(f"    📝 {queued_count} queued tasks removed")
+    if processing_count > 0:
+        print(f"    ⚡ {processing_count} processing tasks removed")
+    print(f"    {DIM}Total: {total_count} tasks cleared and logged{RESET}")
+    print()
+
+
 def daemon_status():
     """Show daemon status and queue information."""
     # Check if daemon is running
@@ -905,6 +955,8 @@ def main():
         daemon_mode()
     elif args[0] == "--daemon-status":
         daemon_status()
+    elif args[0] == "--clear-queue":
+        clear_queue()
     elif args[0] == "--enqueue":
         if len(args) < 2:
             print(f"  {YELLOW}Usage: jarvis-cli --enqueue \"task description\"{RESET}")
