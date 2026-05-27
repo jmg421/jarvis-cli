@@ -17,6 +17,10 @@ import json
 import subprocess
 import time
 import readline
+import signal
+import threading
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 # Agent code lives in the nodes-bio-clean repo
@@ -25,6 +29,9 @@ AGENT_BACKEND = Path.home() / "repos" / "nodes-bio-clean" / "app" / "backend"
 API_URL = os.environ.get("JARVIS_CLI_API", "http://localhost:8000/api/jarvis-cli")
 TASK_FILE = Path("/tmp/jarvis-cli-task.txt")
 LOOP_STATE = Path.home() / ".jarvis_cli_state.json"
+QUEUE_FILE = Path.home() / ".jarvis_cli" / "queue.json"
+COMPLETED_FILE = Path.home() / ".jarvis_cli" / "completed.json"
+DAEMON_PID_FILE = Path.home() / ".jarvis_cli" / "daemon.pid"
 
 CYAN = "\033[1;36m"
 GREEN = "\033[1;32m"
@@ -105,6 +112,9 @@ def show_help():
     jarvis-cli --prioritize    Synthesize next feature priority
     jarvis-cli --build         Send priority to kiro-cli for building
     jarvis-cli --loop          Full cycle: prioritize → build → repeat
+    jarvis-cli --daemon        Start daemon mode (polls queue, executes tasks)
+    jarvis-cli --enqueue "task" Add task to daemon queue
+    jarvis-cli --daemon-status Show daemon status and queue
 """)
 
 
@@ -467,6 +477,282 @@ def _summarize_tc(tc):
     return _summarize_input(tc.get("name", ""), tc.get("input", {}))
 
 
+def enqueue_task(task):
+    """Add a task to the daemon queue."""
+    # Ensure directory exists
+    QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load existing queue
+    queue = []
+    if QUEUE_FILE.exists():
+        try:
+            queue = json.loads(QUEUE_FILE.read_text())
+        except (json.JSONDecodeError, FileNotFoundError):
+            queue = []
+    
+    # Add new task
+    task_entry = {
+        "id": str(uuid.uuid4()),
+        "task": task,
+        "created_at": datetime.now().isoformat(),
+        "status": "queued"
+    }
+    queue.append(task_entry)
+    
+    # Save queue
+    QUEUE_FILE.write_text(json.dumps(queue, indent=2))
+    
+    print(f"  {GREEN}✓ Task queued:{RESET}")
+    print(f"    {DIM}ID: {task_entry['id'][:8]}...{RESET}")
+    print(f"    {task}")
+    print()
+
+
+def load_queue():
+    """Load the task queue."""
+    if not QUEUE_FILE.exists():
+        return []
+    try:
+        return json.loads(QUEUE_FILE.read_text())
+    except (json.JSONDecodeError, FileNotFoundError):
+        return []
+
+
+def save_queue(queue):
+    """Save the task queue."""
+    QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    QUEUE_FILE.write_text(json.dumps(queue, indent=2))
+
+
+def log_completed_task(task_entry, response, error=None):
+    """Log a completed task to completed.json."""
+    COMPLETED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    
+    completed = []
+    if COMPLETED_FILE.exists():
+        try:
+            completed = json.loads(COMPLETED_FILE.read_text())
+        except (json.JSONDecodeError, FileNotFoundError):
+            completed = []
+    
+    completion_entry = {
+        **task_entry,
+        "completed_at": datetime.now().isoformat(),
+        "response": response,
+        "error": error,
+        "status": "completed" if not error else "failed"
+    }
+    
+    completed.append(completion_entry)
+    
+    # Keep only last 1000 completed tasks
+    if len(completed) > 1000:
+        completed = completed[-1000:]
+    
+    COMPLETED_FILE.write_text(json.dumps(completed, indent=2))
+
+
+def execute_task(task):
+    """Execute a single task using the agent."""
+    local_mode = not _api_reachable()
+    
+    if local_mode:
+        api_key = _get_local_key()
+        if not api_key:
+            return None, "ANTHROPIC_API_KEY not set"
+        
+        # Import and run agent
+        sys.path.insert(0, str(AGENT_BACKEND))
+        try:
+            from nodesbio.services.jarvis_next.agent import run_agent
+            import asyncio
+            
+            result = asyncio.run(run_agent(task, api_key))
+            return result.get("response", ""), None
+        except Exception as e:
+            return None, str(e)
+    else:
+        # Use API
+        import urllib.request
+        payload = json.dumps({"prompt": task}).encode()
+        try:
+            req = urllib.request.Request(
+                f"{API_URL}/run",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                result = json.loads(resp.read())
+            return result.get("response", ""), None
+        except Exception as e:
+            return None, str(e)
+
+
+def daemon_status():
+    """Show daemon status and queue information."""
+    # Check if daemon is running
+    daemon_running = False
+    if DAEMON_PID_FILE.exists():
+        try:
+            pid = int(DAEMON_PID_FILE.read_text().strip())
+            # Check if process is actually running
+            os.kill(pid, 0)  # Doesn't actually kill, just checks if process exists
+            daemon_running = True
+        except (OSError, ProcessLookupError, ValueError):
+            # Process doesn't exist, clean up stale pid file
+            DAEMON_PID_FILE.unlink(missing_ok=True)
+    
+    print(f"""
+  {CYAN}╭{'─' * 50}╮{RESET}
+  {CYAN}│{RESET} {BOLD}Jarvis Daemon Status{RESET}                            {CYAN}│{RESET}
+  {CYAN}╰{'─' * 50}╯{RESET}
+
+  {GREEN}Daemon:{RESET} {'🟢 Running' if daemon_running else '🔴 Stopped'}""")
+    
+    if daemon_running:
+        pid = int(DAEMON_PID_FILE.read_text().strip())
+        print(f"  {DIM}PID: {pid}{RESET}")
+    
+    # Show queue status
+    queue = load_queue()
+    queued_tasks = [t for t in queue if t.get("status") == "queued"]
+    processing_tasks = [t for t in queue if t.get("status") == "processing"]
+    
+    print(f"""
+  {GREEN}Queue:{RESET}
+    📝 Queued: {len(queued_tasks)}
+    ⚡ Processing: {len(processing_tasks)}""")
+    
+    # Show recent completed tasks
+    if COMPLETED_FILE.exists():
+        try:
+            completed = json.loads(COMPLETED_FILE.read_text())
+            recent = completed[-5:] if completed else []
+            if recent:
+                print(f"""
+  {GREEN}Recent completions:{RESET}""")
+                for task in recent:
+                    status_icon = "✅" if task.get("status") == "completed" else "❌"
+                    task_preview = task.get("task", "")[:50] + "..." if len(task.get("task", "")) > 50 else task.get("task", "")
+                    completed_time = datetime.fromisoformat(task["completed_at"]).strftime("%H:%M:%S")
+                    print(f"    {status_icon} {completed_time} {DIM}{task_preview}{RESET}")
+        except (json.JSONDecodeError, ValueError):
+            pass
+    
+    # Show next few queued tasks
+    if queued_tasks:
+        print(f"""
+  {GREEN}Next in queue:{RESET}""")
+        for i, task in enumerate(queued_tasks[:3]):
+            task_preview = task.get("task", "")[:60] + "..." if len(task.get("task", "")) > 60 else task.get("task", "")
+            created_time = datetime.fromisoformat(task["created_at"]).strftime("%H:%M")
+            print(f"    {i+1}. {created_time} {DIM}{task_preview}{RESET}")
+        
+        if len(queued_tasks) > 3:
+            print(f"    {DIM}... +{len(queued_tasks) - 3} more{RESET}")
+    
+    print()
+
+
+def daemon_mode():
+    """Start daemon mode - polls queue and executes tasks."""
+    # Check if already running
+    if DAEMON_PID_FILE.exists():
+        try:
+            pid = int(DAEMON_PID_FILE.read_text().strip())
+            os.kill(pid, 0)  # Check if process exists
+            print(f"  {YELLOW}Daemon already running (PID {pid}){RESET}")
+            return
+        except (OSError, ProcessLookupError, ValueError):
+            # Stale pid file
+            DAEMON_PID_FILE.unlink(missing_ok=True)
+    
+    # Write our PID
+    DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DAEMON_PID_FILE.write_text(str(os.getpid()))
+    
+    print(f"""
+  {CYAN}╭{'─' * 50}╮{RESET}
+  {CYAN}│{RESET} {BOLD}Jarvis Daemon Started{RESET}                           {CYAN}│{RESET}
+  {CYAN}╰{'─' * 50}╯{RESET}
+
+  {GREEN}●{RESET} Polling: {DIM}~/.jarvis_cli/queue.json{RESET}
+  {GREEN}●{RESET} Logging: {DIM}~/.jarvis_cli/completed.json{RESET}
+  {GREEN}●{RESET} PID: {DIM}{os.getpid()}{RESET}
+
+  {DIM}Press Ctrl+C to stop{RESET}
+""")
+    
+    # Set up signal handlers for clean shutdown
+    def signal_handler(signum, frame):
+        print(f"\n  {YELLOW}Shutting down daemon...{RESET}")
+        DAEMON_PID_FILE.unlink(missing_ok=True)
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    last_queue_check = 0
+    
+    try:
+        while True:
+            current_time = time.time()
+            
+            # Check queue every 2 seconds
+            if current_time - last_queue_check >= 2:
+                last_queue_check = current_time
+                
+                queue = load_queue()
+                queued_tasks = [t for t in queue if t.get("status") == "queued"]
+                
+                if queued_tasks:
+                    # Process the first queued task
+                    task_entry = queued_tasks[0]
+                    task_id = task_entry["id"]
+                    task = task_entry["task"]
+                    
+                    print(f"  {MAGENTA}⚡ Processing:{RESET} {task[:60]}{'...' if len(task) > 60 else ''}")
+                    print(f"  {DIM}ID: {task_id[:8]}...{RESET}")
+                    
+                    # Mark as processing
+                    for i, t in enumerate(queue):
+                        if t["id"] == task_id:
+                            queue[i]["status"] = "processing"
+                            queue[i]["started_at"] = datetime.now().isoformat()
+                            break
+                    save_queue(queue)
+                    
+                    # Execute the task
+                    response, error = execute_task(task)
+                    
+                    # Remove from queue and log completion
+                    queue = [t for t in queue if t["id"] != task_id]
+                    save_queue(queue)
+                    log_completed_task(task_entry, response, error)
+                    
+                    if error:
+                        print(f"  {YELLOW}❌ Failed:{RESET} {error}")
+                    else:
+                        print(f"  {GREEN}✅ Completed{RESET}")
+                        if response:
+                            # Show first few lines of response
+                            lines = response.split('\n')[:3]
+                            for line in lines:
+                                if line.strip():
+                                    print(f"  {DIM}  {line[:80]}{RESET}")
+                            if len(response.split('\n')) > 3:
+                                print(f"  {DIM}  ... (response logged){RESET}")
+                    print()
+            
+            time.sleep(0.5)
+            
+    except KeyboardInterrupt:
+        print(f"\n  {YELLOW}Daemon stopped{RESET}")
+    finally:
+        DAEMON_PID_FILE.unlink(missing_ok=True)
+
+
 def main():
     args = sys.argv[1:]
 
@@ -480,6 +766,16 @@ def main():
         build()
     elif args[0] == "--loop":
         loop()
+    elif args[0] == "--daemon":
+        daemon_mode()
+    elif args[0] == "--daemon-status":
+        daemon_status()
+    elif args[0] == "--enqueue":
+        if len(args) < 2:
+            print(f"  {YELLOW}Usage: jarvis-cli --enqueue \"task description\"{RESET}")
+            return
+        task = " ".join(args[1:])
+        enqueue_task(task)
     else:
         # One-shot
         import urllib.request
