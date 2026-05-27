@@ -3,7 +3,7 @@ name = "jarvis-cli"
 version = "0.1.0"
 description = "Self-improving agentic CLI powered by AI Synthesis"
 requires-python = ">=3.11"
-dependencies = ["httpx>=0.27"]
+dependencies = ["httpx>=0.27", "pytest>=7.0", "pytest-asyncio>=0.21"]
 
 [project.scripts]
 jarvis-cli = "jarvis_cli.main:main"
