@@ -112,6 +112,7 @@ def show_help():
     jarvis-cli --prioritize    Synthesize next feature priority
     jarvis-cli --build         Send priority to kiro-cli for building
     jarvis-cli --loop          Full cycle: prioritize → build → repeat
+    jarvis-cli --status        Show iteration count, tools available, last 5 tasks
     jarvis-cli --daemon        Start daemon mode (polls queue, executes tasks)
     jarvis-cli --enqueue "task" Add task to daemon queue
     jarvis-cli --daemon-status Show daemon status and queue
@@ -566,8 +567,18 @@ def execute_task(task):
         try:
             from nodesbio.services.jarvis_next.agent import run_agent
             import asyncio
-            
-            result = asyncio.run(run_agent(task, api_key))
+
+            async def on_event(e):
+                if e.get("type") == "tool_call":
+                    name = e["name"]
+                    inp = e.get("input", {})
+                    summary = _summarize_input(name, inp)
+                    print(f"    {MAGENTA}⚡ {name}{RESET} {DIM}{summary}{RESET}")
+                elif e.get("type") == "tool_result":
+                    preview = e.get("result", "")[:80].replace("\n", " ")
+                    print(f"    {DIM}→ {preview}{RESET}")
+
+            result = asyncio.run(run_agent(task, api_key, on_event=on_event))
             return result.get("response", ""), None
         except Exception as e:
             return None, str(e)
@@ -587,6 +598,67 @@ def execute_task(task):
             return result.get("response", ""), None
         except Exception as e:
             return None, str(e)
+
+
+def status():
+    """Show iteration count, tools available, and last 5 completed tasks."""
+    state = get_state()
+    
+    print(f"""
+  {CYAN}╭{'─' * 60}╮{RESET}
+  {CYAN}│{RESET} {BOLD}Jarvis CLI Status{RESET}                                      {CYAN}│{RESET}
+  {CYAN}╰{'─' * 60}╯{RESET}
+
+  {GREEN}Iteration:{RESET} #{state['iteration']}
+  {GREEN}Tools Available:{RESET} {len(CAPABILITIES)}""")
+    
+    # Show tools in a compact grid format
+    tools = list(CAPABILITIES.keys())
+    cols = 3
+    for i in range(0, len(tools), cols):
+        row = tools[i:i+cols]
+        formatted_row = []
+        for tool in row:
+            formatted_row.append(f"{tool:<20}")
+        print(f"    {CYAN}•{RESET} {' '.join(formatted_row)}")
+    
+    # Show last 5 completed tasks
+    print(f"""
+  {GREEN}Last 5 Completed Tasks:{RESET}""")
+    
+    if COMPLETED_FILE.exists():
+        try:
+            completed = json.loads(COMPLETED_FILE.read_text())
+            recent = completed[-5:] if completed else []
+            if recent:
+                for i, task in enumerate(recent, 1):
+                    status_icon = "✅" if task.get("status") == "completed" else "❌"
+                    task_preview = task.get("task", "")[:50] + "..." if len(task.get("task", "")) > 50 else task.get("task", "")
+                    completed_time = datetime.fromisoformat(task["completed_at"]).strftime("%m/%d %H:%M")
+                    print(f"    {i}. {status_icon} {completed_time} {DIM}{task_preview}{RESET}")
+            else:
+                print(f"    {DIM}No completed tasks yet{RESET}")
+        except (json.JSONDecodeError, ValueError):
+            print(f"    {DIM}No completed tasks yet{RESET}")
+    else:
+        print(f"    {DIM}No completed tasks yet{RESET}")
+    
+    # Show current priority if any
+    if state.get("next_priority"):
+        print(f"""
+  {GREEN}Current Priority:{RESET}
+    {BOLD}{state['next_priority']}{RESET}""")
+    
+    # Show built features
+    if state.get("built"):
+        print(f"""
+  {GREEN}Built Features ({len(state['built'])}):{RESET}""")
+        for i, feature in enumerate(state["built"][-5:], 1):
+            print(f"    {i}. {feature}")
+        if len(state["built"]) > 5:
+            print(f"    {DIM}... +{len(state['built']) - 5} more{RESET}")
+    
+    print()
 
 
 def daemon_status():
@@ -655,6 +727,31 @@ def daemon_status():
     print()
 
 
+def _next_idle_task():
+    """Pick the next self-improvement task when queue is empty."""
+    # Check what's already been completed to avoid repeats
+    completed_tasks = set()
+    if COMPLETED_FILE.exists():
+        try:
+            completed = json.loads(COMPLETED_FILE.read_text())
+            completed_tasks = {t.get("task", "")[:50] for t in completed}
+        except (json.JSONDecodeError, FileNotFoundError):
+            pass
+
+    idle_tasks = [
+        "In ~/repos/jarvis-cli, review the test suite and add any missing edge case tests. Use dev_pipeline to ship.",
+        "In ~/repos/jarvis-cli, add a --status command that shows iteration count, tools available, and last 5 completed tasks. Use dev_pipeline to ship.",
+        "In ~/repos/nodes-bio-clean, run the jarvis_next test suite and fix any failures. Use dev_pipeline to ship.",
+        "In ~/repos/jarvis-cli, add elapsed time display to daemon task execution output. Use dev_pipeline to ship.",
+        "In ~/repos/jarvis-cli, add a --clear-queue command that empties the queue. Use dev_pipeline to ship.",
+    ]
+
+    for task in idle_tasks:
+        if task[:50] not in completed_tasks:
+            return task
+    return None
+
+
 def daemon_mode():
     """Start daemon mode - polls queue and executes tasks."""
     # Check if already running
@@ -705,6 +802,15 @@ def daemon_mode():
                 
                 queue = load_queue()
                 queued_tasks = [t for t in queue if t.get("status") == "queued"]
+                
+                if not queued_tasks:
+                    # Auto-enqueue a self-improvement task when idle
+                    idle_task = _next_idle_task()
+                    if idle_task:
+                        print(f"  {DIM}Queue empty — auto-enqueuing:{RESET}")
+                        enqueue_task(idle_task)
+                        queue = load_queue()
+                        queued_tasks = [t for t in queue if t.get("status") == "queued"]
                 
                 if queued_tasks:
                     # Process the first queued task
@@ -760,6 +866,8 @@ def main():
         interactive()
     elif args[0] in ("-h", "--help"):
         show_help()
+    elif args[0] == "--status":
+        status()
     elif args[0] == "--prioritize":
         prioritize()
     elif args[0] == "--build":
