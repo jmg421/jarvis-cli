@@ -125,6 +125,7 @@ def show_help():
     jarvis-cli --replay        Replay last completed task's tool calls (animated)
     jarvis-cli --index <dir>   Build codebase index for directory
     jarvis-cli --index-force <dir> Force rebuild codebase index
+    jarvis-cli --log [N]       Show last N completed tasks (default: 5)
 """)
 
 
@@ -822,6 +823,114 @@ def execute_task(task):
             return None, str(e), elapsed_time, []
 
 
+def show_log(count=5):
+    """Show last N completed tasks in pretty format."""
+    if not COMPLETED_FILE.exists():
+        print(f"""
+  {CYAN}╭{'─' * 50}╮{RESET}
+  {CYAN}│{RESET} {BOLD}Jarvis CLI Log{RESET}                                  {CYAN}│{RESET}
+  {CYAN}╰{'─' * 50}╯{RESET}
+
+  {DIM}No completed tasks found{RESET}
+""")
+        return
+
+    try:
+        completed = json.loads(COMPLETED_FILE.read_text())
+    except (json.JSONDecodeError, FileNotFoundError):
+        print(f"""
+  {CYAN}╭{'─' * 50}╮{RESET}
+  {CYAN}│{RESET} {BOLD}Jarvis CLI Log{RESET}                                  {CYAN}│{RESET}
+  {CYAN}╰{'─' * 50}╯{RESET}
+
+  {DIM}No completed tasks found{RESET}
+""")
+        return
+
+    if not completed:
+        print(f"""
+  {CYAN}╭{'─' * 50}╮{RESET}
+  {CYAN}│{RESET} {BOLD}Jarvis CLI Log{RESET}                                  {CYAN}│{RESET}
+  {CYAN}╰{'─' * 50}╯{RESET}
+
+  {DIM}No completed tasks found{RESET}
+""")
+        return
+
+    # Get the last N tasks
+    recent = completed[-count:] if completed else []
+    total_count = len(completed)
+
+    print(f"""
+  {CYAN}╭{'─' * 70}╮{RESET}
+  {CYAN}│{RESET} {BOLD}Jarvis CLI Log{RESET} — Last {len(recent)} of {total_count} completed tasks{'':>23}{CYAN}│{RESET}
+  {CYAN}╰{'─' * 70}╯{RESET}""")
+
+    if not recent:
+        print(f"  {DIM}No completed tasks found{RESET}\n")
+        return
+
+    for i, task in enumerate(recent, 1):
+        # Status and timing info
+        status_icon = "✅" if task.get("status") == "completed" else "❌" if task.get("status") == "failed" else "🔄"
+        
+        completed_time = None
+        if task.get("completed_at"):
+            try:
+                completed_time = datetime.fromisoformat(task["completed_at"]).strftime("%m/%d %H:%M:%S")
+            except ValueError:
+                completed_time = task["completed_at"][:19]  # Fallback
+        
+        elapsed_time = task.get("elapsed_time")
+        elapsed_str = f" ({_format_elapsed_time(elapsed_time)})" if elapsed_time else ""
+
+        # Task content
+        task_content = task.get("task", "")
+        
+        # Header line with status and time
+        print(f"\n  {CYAN}[{len(recent) - i + (total_count - count)}]{RESET} {status_icon} {BOLD}{completed_time}{RESET}{elapsed_str}")
+        
+        # Task content, wrapped nicely
+        if len(task_content) <= 66:
+            print(f"      {task_content}")
+        else:
+            # Wrap long tasks
+            words = task_content.split()
+            current_line = "      "
+            for word in words:
+                if len(current_line) + len(word) + 1 > 72:
+                    print(current_line)
+                    current_line = f"      {word}"
+                else:
+                    if len(current_line) > 6:
+                        current_line += f" {word}"
+                    else:
+                        current_line += word
+            if len(current_line) > 6:
+                print(current_line)
+
+        # Tool calls summary
+        tool_calls = task.get("tool_calls", [])
+        if tool_calls:
+            tool_names = [tc.get("name", "unknown") for tc in tool_calls]
+            tool_summary = ", ".join(dict.fromkeys(tool_names))  # Remove duplicates, preserve order
+            if len(tool_summary) > 60:
+                tool_summary = tool_summary[:57] + "..."
+            print(f"      {DIM}Tools: {tool_summary}{RESET}")
+
+        # Error message if failed
+        if task.get("status") == "failed" and task.get("error"):
+            error_msg = task["error"]
+            if len(error_msg) > 60:
+                error_msg = error_msg[:57] + "..."
+            print(f"      {YELLOW}Error: {error_msg}{RESET}")
+
+    print(f"\n  {DIM}Use 'jarvis-cli --log N' to show more tasks{RESET}")
+    if total_count > count:
+        print(f"  {DIM}Showing {count} of {total_count} total completed tasks{RESET}")
+    print()
+
+
 def status():
     """Show iteration count, tools available, and last 5 completed tasks."""
     state = get_state()
@@ -1407,6 +1516,18 @@ def main():
             return
         directory = args[1]
         codebase_index(directory, force_rebuild=True)
+    elif args[0] == "--log":
+        count = 5  # default
+        if len(args) > 1:
+            try:
+                count = int(args[1])
+                if count <= 0:
+                    print(f"  {YELLOW}Count must be a positive integer{RESET}")
+                    return
+            except ValueError:
+                print(f"  {YELLOW}Invalid count: {args[1]}. Must be a number.{RESET}")
+                return
+        show_log(count)
     else:
         # One-shot
         import urllib.request
