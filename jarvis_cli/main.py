@@ -126,7 +126,98 @@ def show_help():
     jarvis-cli --index <dir>   Build codebase index for directory
     jarvis-cli --index-force <dir> Force rebuild codebase index
     jarvis-cli --log [N]       Show last N completed tasks (default: 5)
+    jarvis-cli --watch [dir]   Watch dir for .py changes, auto-run pytest
 """)
+
+
+def _scan_py_files(root: Path):
+    """Return {path: mtime} for all .py files under root (skips junk dirs)."""
+    skip = {".git", ".venv", "venv", "__pycache__", ".pytest_cache",
+            "node_modules", ".mypy_cache", ".ruff_cache", "dist", "build",
+            ".tox", ".eggs"}
+    snapshot = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        # prune in-place
+        dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")]
+        for fn in filenames:
+            if fn.endswith(".py"):
+                p = Path(dirpath) / fn
+                try:
+                    snapshot[str(p)] = p.stat().st_mtime
+                except OSError:
+                    pass
+    return snapshot
+
+
+def _run_pytest(directory: Path):
+    """Run pytest in the given directory, stream output."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"\n  {CYAN}▶ [{ts}] running pytest in {directory}...{RESET}")
+    start = time.time()
+    try:
+        result = subprocess.run(
+            ["python3", "-m", "pytest", "-q", "--color=yes"],
+            cwd=str(directory),
+        )
+        rc = result.returncode
+    except FileNotFoundError:
+        print(f"  {YELLOW}pytest not available (python3 missing){RESET}")
+        return
+    elapsed = time.time() - start
+    if rc == 0:
+        print(f"  {GREEN}✓ pytest passed{RESET} {DIM}({elapsed:.2f}s){RESET}")
+    else:
+        print(f"  {YELLOW}✗ pytest failed (exit {rc}){RESET} {DIM}({elapsed:.2f}s){RESET}")
+
+
+def watch_directory(directory: str = ".", interval: float = 1.0):
+    """Watch a directory for .py file changes; re-run pytest on change."""
+    root = Path(directory).expanduser().resolve()
+    if not root.exists():
+        print(f"  {YELLOW}Directory not found: {root}{RESET}")
+        return
+    if not root.is_dir():
+        print(f"  {YELLOW}Not a directory: {root}{RESET}")
+        return
+
+    print(f"  {CYAN}╭{'─' * 56}╮{RESET}")
+    print(f"  {CYAN}│{RESET} {BOLD}Watch Mode{RESET} — auto-pytest on .py changes              {CYAN}│{RESET}")
+    print(f"  {CYAN}╰{'─' * 56}╯{RESET}")
+    print(f"  {DIM}watching:{RESET} {root}")
+    print(f"  {DIM}interval:{RESET} {interval}s   {DIM}(Ctrl+C to stop){RESET}")
+
+    snapshot = _scan_py_files(root)
+    print(f"  {DIM}tracking {len(snapshot)} .py file(s){RESET}")
+
+    # initial run
+    _run_pytest(root)
+
+    try:
+        while True:
+            time.sleep(interval)
+            current = _scan_py_files(root)
+            changed = []
+            for path, mtime in current.items():
+                if path not in snapshot:
+                    changed.append(("+", path))
+                elif snapshot[path] != mtime:
+                    changed.append(("M", path))
+            for path in snapshot:
+                if path not in current:
+                    changed.append(("-", path))
+
+            if changed:
+                print(f"\n  {MAGENTA}⚡ detected {len(changed)} change(s):{RESET}")
+                for sym, path in changed[:5]:
+                    rel = os.path.relpath(path, root)
+                    color = GREEN if sym == "+" else (YELLOW if sym == "M" else DIM)
+                    print(f"    {color}{sym}{RESET} {rel}")
+                if len(changed) > 5:
+                    print(f"    {DIM}... +{len(changed) - 5} more{RESET}")
+                snapshot = current
+                _run_pytest(root)
+    except KeyboardInterrupt:
+        print(f"\n  {DIM}watch mode stopped{RESET}")
 
 
 def prioritize():
@@ -1528,6 +1619,19 @@ def main():
                 print(f"  {YELLOW}Invalid count: {args[1]}. Must be a number.{RESET}")
                 return
         show_log(count)
+    elif args[0] == "--watch":
+        directory = args[1] if len(args) > 1 else "."
+        interval = 1.0
+        if len(args) > 2:
+            try:
+                interval = float(args[2])
+                if interval <= 0:
+                    print(f"  {YELLOW}Interval must be > 0{RESET}")
+                    return
+            except ValueError:
+                print(f"  {YELLOW}Invalid interval: {args[2]}{RESET}")
+                return
+        watch_directory(directory, interval)
     else:
         # One-shot
         import urllib.request
