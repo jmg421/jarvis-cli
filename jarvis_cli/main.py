@@ -127,6 +127,7 @@ def show_help():
     jarvis-cli --index-force <dir> Force rebuild codebase index
     jarvis-cli --log [N]       Show last N completed tasks (default: 5)
     jarvis-cli --watch [dir]   Watch dir for .py changes, auto-run pytest
+    jarvis-cli --dashboard [port] Serve dashboard (default port 7294)
 """)
 
 
@@ -1671,6 +1672,16 @@ def main():
                 print(f"  {YELLOW}Invalid interval: {args[2]}{RESET}")
                 return
         watch_directory(directory, interval)
+    elif args[0] == "--dashboard":
+        from jarvis_cli import dashboard
+        port = dashboard.DEFAULT_PORT
+        if len(args) > 1:
+            try:
+                port = int(args[1])
+            except ValueError:
+                print(f"  {YELLOW}Invalid port: {args[1]}{RESET}")
+                return
+        dashboard.serve(port=port)
     else:
         # One-shot
         import urllib.request
