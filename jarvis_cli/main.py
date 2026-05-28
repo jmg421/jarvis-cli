@@ -860,6 +860,43 @@ def log_completed_task(task_entry, response, error=None, elapsed_time=None, tool
     COMPLETED_FILE.write_text(json.dumps(completed, indent=2))
 
 
+def _auto_push_origin_main():
+    """After a successful task, push committed changes to origin/main.
+
+    The dev_pipeline tool merges feature branches into main locally; we mirror
+    that to GitHub here so the remote stays in sync with autonomous work.
+    Silently no-ops if the cwd isn't a git repo, has no 'origin' remote, or
+    has nothing to push.
+    """
+    try:
+        # Confirm we're inside a git repo
+        r = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return
+        # Confirm 'origin' remote exists
+        r = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return
+        # Push main to origin
+        r = subprocess.run(
+            ["git", "push", "origin", "main"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0:
+            print(f"    {GREEN}↑ pushed origin/main{RESET}")
+        else:
+            err = (r.stderr or r.stdout).strip().splitlines()[-1:] or [""]
+            print(f"    {DIM}↑ push skipped: {err[0]}{RESET}")
+    except Exception as e:
+        print(f"    {DIM}↑ push error: {e}{RESET}")
+
+
 def execute_task(task):
     """Execute a single task using the agent."""
     start_time = time.time()
@@ -889,6 +926,7 @@ def execute_task(task):
             result = asyncio.run(run_agent(task, api_key, on_event=on_event))
             elapsed_time = time.time() - start_time
             tool_calls = result.get("tool_calls", [])
+            _auto_push_origin_main()
             return result.get("response", ""), None, elapsed_time, tool_calls
         except Exception as e:
             elapsed_time = time.time() - start_time
@@ -908,6 +946,7 @@ def execute_task(task):
                 result = json.loads(resp.read())
             elapsed_time = time.time() - start_time
             tool_calls = result.get("tool_calls", [])
+            _auto_push_origin_main()
             return result.get("response", ""), None, elapsed_time, tool_calls
         except Exception as e:
             elapsed_time = time.time() - start_time
