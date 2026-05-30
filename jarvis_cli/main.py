@@ -643,8 +643,10 @@ def _run_local(prompt, api_key, session_id):
                 sys.stdout.flush()
             i += 1
             time.sleep(0.1)
-        sys.stdout.write("\r" + " " * 30 + "\r")
-        sys.stdout.flush()
+        # Only clear spinner line if we were still showing it
+        if not got_first_event[0]:
+            sys.stdout.write("\r" + " " * 30 + "\r")
+            sys.stdout.flush()
 
     spinner_thread = threading.Thread(target=spin, daemon=True)
     spinner_thread.start()
@@ -708,10 +710,12 @@ def _run_local(prompt, api_key, session_id):
     try:
         asyncio.run(_stream())
         spinning[0] = False
-        spinner_thread.join(timeout=0.5)
+        spinner_thread.join(timeout=1.0)
+        # Ensure streamed text ends with a newline
+        if text_started[0]:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         if cancelled[0]:
-            if text_started[0]:
-                sys.stdout.write("\n")
             print(f"\n  {YELLOW}⚡ Cancelled{RESET}\n")
         result["response"] = "".join(streamed_text)
         return result
