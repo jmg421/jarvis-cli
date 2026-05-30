@@ -41,7 +41,7 @@ jarvis-cli --daemon-status
 ## Architecture
 
 - **This repo**: CLI entry point, UI, Stream Deck integration, self-improvement loop
-- **nodes-bio-clean**: Agent brain (tools, executor, memory) at `app/backend/nodesbio/services/jarvis_next/`
+- **nodes-bio**: Agent brain (tools, executor, memory) at `app/backend/nodesbio/services/jarvis_next/`
 
 ## Usage
 
@@ -54,4 +54,4 @@ jarvis-cli --loop       # Self-improvement cycle
 ## Requirements
 
 - `~/.jarvis_cli/api_key` — Anthropic API key
-- `~/repos/nodes-bio-clean/` — Agent backend code
+- `~/repos/nodes-bio/` — Agent backend code

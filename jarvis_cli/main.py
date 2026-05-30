@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Agent code lives in the nodes-bio repo
-AGENT_BACKEND = Path.home() / "repos" / "nodes-bio" / "app" / "backend"
+AGENT_BACKEND = Path.home() / "repos" / "jarvis-agent"
 
 API_URL = os.environ.get("JARVIS_CLI_API", "http://localhost:8000/api/jarvis-cli")
 TASK_FILE = Path("/tmp/jarvis-cli-task.txt")
@@ -84,8 +84,8 @@ def _scan_inventory():
 
     try:
         sys.path.insert(0, str(AGENT_BACKEND))
-        from nodesbio.services.jarvis_next.tools import TOOLS as LIVE_TOOLS
-        from nodesbio.services.jarvis_next.executor import EXECUTORS as LIVE_EXECUTORS
+        from jarvis_agent.tools import TOOLS as LIVE_TOOLS
+        from jarvis_agent.executor import EXECUTORS as LIVE_EXECUTORS
 
         # Build live tool map from schema definitions (authoritative)
         live_tools = {t["name"]: t["description"].split(".")[0] for t in LIVE_TOOLS}
@@ -336,7 +336,7 @@ def build():
         print(f"  {GREEN}✓ Resuming task:{RESET} {DIM}(session {resume_sid}){RESET}")
         print(f"    {DIM}{priority[:80]}{RESET}\n")
     else:
-        task = f"Build this feature for Jarvis CLI (in ~/repos/nodes-bio/app/backend/nodesbio/services/jarvis_next/): {priority}"
+        task = f"Build this feature for Jarvis Agent (in ~/repos/jarvis-agent/jarvis_agent/): {priority}"
         print(f"  {GREEN}✓ Executing task:{RESET}")
         print(f"    {DIM}{task[:100]}{RESET}\n")
 
@@ -388,7 +388,7 @@ def _show_sessions():
     """Display recent sessions."""
     sys.path.insert(0, str(AGENT_BACKEND))
     try:
-        from nodesbio.services.jarvis_next.memory import list_sessions
+        from jarvis_agent.memory import list_sessions
     except ImportError:
         print(f"  {YELLOW}Cannot load session memory module{RESET}\n")
         return
@@ -624,10 +624,10 @@ def _run_local(prompt, api_key, session_id):
 
     sys.path.insert(0, str(AGENT_BACKEND))
     try:
-        from nodesbio.services.jarvis_next.agent import run_agent_stream
+        from jarvis_agent.agent import run_agent_stream
     except ImportError as e:
         print(f"  {YELLOW}❌ Cannot import agent: {e}{RESET}")
-        print(f"  {DIM}Expected at: {AGENT_BACKEND}/nodesbio/services/jarvis_next/{RESET}\n")
+        print(f"  {DIM}Expected at: {AGENT_BACKEND}/jarvis_agent/{RESET}\n")
         return None
 
     SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -1195,7 +1195,7 @@ def execute_task(task, session_id=None):
         # Import and run agent
         sys.path.insert(0, str(AGENT_BACKEND))
         try:
-            from nodesbio.services.jarvis_next.agent import run_agent
+            from jarvis_agent.agent import run_agent
             import asyncio
 
             async def on_event(e):
