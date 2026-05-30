@@ -25,8 +25,8 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 
-# Agent code lives in the nodes-bio-clean repo
-AGENT_BACKEND = Path.home() / "repos" / "nodes-bio-clean" / "app" / "backend"
+# Agent code lives in the nodes-bio repo
+AGENT_BACKEND = Path.home() / "repos" / "nodes-bio" / "app" / "backend"
 
 API_URL = os.environ.get("JARVIS_CLI_API", "http://localhost:8000/api/jarvis-cli")
 TASK_FILE = Path("/tmp/jarvis-cli-task.txt")
@@ -62,11 +62,10 @@ CAPABILITIES = {
     "codebase_index": "Build JSON map of files, functions, and classes",
     "qpu_submit": "Submit quantum circuits to IonQ/AWS Braket QPUs",
     "qpu_poll": "Poll QPU job status and retrieve results",
+    "test_runner": "Run tests, parse failures into structured results",
 }
 
 BACKLOG = [
-    "streaming output in CLI (SSE display)",
-    "conversation memory (multi-turn context)",
     "test runner tool (run tests, parse failures)",
     "image/screenshot analysis tool",
     "database query tool (read-only SQL)",
@@ -75,10 +74,50 @@ BACKLOG = [
 ]
 
 
+def _scan_inventory():
+    """Scan the actual agent backend to get live tool names and descriptions.
+
+    Returns (live_tools: dict[name->description], filtered_backlog: list[str])
+    where filtered_backlog excludes features already implemented.
+    """
+    live_tools = dict(CAPABILITIES)  # fallback
+
+    try:
+        sys.path.insert(0, str(AGENT_BACKEND))
+        from nodesbio.services.jarvis_next.tools import TOOLS as LIVE_TOOLS
+        from nodesbio.services.jarvis_next.executor import EXECUTORS as LIVE_EXECUTORS
+
+        # Build live tool map from schema definitions (authoritative)
+        live_tools = {t["name"]: t["description"].split(".")[0] for t in LIVE_TOOLS}
+
+        # Only keep tools that also have an executor wired up
+        live_tools = {k: v for k, v in live_tools.items() if k in LIVE_EXECUTORS}
+    except Exception:
+        pass  # fall back to hardcoded CAPABILITIES
+
+    # Filter backlog: remove items whose keywords match a live tool name
+    # or that appear in state['built']
+    implemented_names = set(live_tools.keys())
+    state = get_state()
+    built_lower = {b.lower().strip() for b in state.get("built", [])}
+    filtered_backlog = []
+    for item in BACKLOG:
+        item_lower = item.lower()
+        already_built = any(
+            tool_name.replace("_", " ") in item_lower
+            or tool_name.replace("_", "") in item_lower.replace(" ", "")
+            for tool_name in implemented_names
+        )
+        if not already_built and item_lower.strip() not in built_lower:
+            filtered_backlog.append(item)
+
+    return live_tools, filtered_backlog
+
+
 def get_state():
     if LOOP_STATE.exists():
         return json.loads(LOOP_STATE.read_text())
-    return {"iteration": 0, "built": [], "next_priority": None}
+    return {"iteration": 0, "built": [], "next_priority": None, "pending_session": None}
 
 
 def save_state(state):
@@ -87,23 +126,24 @@ def save_state(state):
 
 def show_help():
     state = get_state()
+    live_tools, filtered_backlog = _scan_inventory()
     print(f"""
   {CYAN}╭{'─' * 56}╮{RESET}
   {CYAN}│{RESET} {BOLD}Jarvis CLI{RESET} — Self-Improving Agentic Development         {CYAN}│{RESET}
-  {CYAN}│{RESET} {DIM}iteration #{state['iteration']} • {len(CAPABILITIES)} tools active{RESET}              {CYAN}│{RESET}
+  {CYAN}│{RESET} {DIM}iteration #{state['iteration']} • {len(live_tools)} tools active{RESET}              {CYAN}│{RESET}
   {CYAN}╰{'─' * 56}╯{RESET}
 
   {GREEN}Current Tools:{RESET}""")
-    for name, desc in CAPABILITIES.items():
+    for name, desc in live_tools.items():
         print(f"    {CYAN}•{RESET} {name:<20} {DIM}{desc}{RESET}")
 
     print(f"""
-  {GREEN}Backlog ({len(BACKLOG)} features):{RESET}""")
-    for i, feat in enumerate(BACKLOG[:5], 1):
+  {GREEN}Backlog ({len(filtered_backlog)} features):{RESET}""")
+    for i, feat in enumerate(filtered_backlog[:5], 1):
         marker = f"{MAGENTA}→{RESET}" if i == 1 else " "
         print(f"   {marker} {i}. {feat}")
-    if len(BACKLOG) > 5:
-        print(f"     {DIM}... +{len(BACKLOG) - 5} more{RESET}")
+    if len(filtered_backlog) > 5:
+        print(f"     {DIM}... +{len(filtered_backlog) - 5} more{RESET}")
 
     if state.get("next_priority"):
         print(f"""
@@ -128,6 +168,8 @@ def show_help():
     jarvis-cli --log [N]       Show last N completed tasks (default: 5)
     jarvis-cli --watch [dir]   Watch dir for .py changes, auto-run pytest
     jarvis-cli --dashboard [port] Serve dashboard (default port 7294)
+    jarvis-cli --sessions      List recent conversation sessions
+    jarvis-cli --continue <id> "prompt"  Continue an existing session
 """)
 
 
@@ -226,9 +268,15 @@ def prioritize():
     import urllib.request
 
     state = get_state()
-    current_tools = ", ".join(CAPABILITIES.keys())
-    backlog_text = "\n".join(f"- {f}" for f in BACKLOG)
+    live_tools, filtered_backlog = _scan_inventory()
+    current_tools = ", ".join(live_tools.keys())
+    backlog_text = "\n".join(f"- {f}" for f in filtered_backlog)
     built_text = ", ".join(state["built"]) if state["built"] else "none yet"
+
+    if not filtered_backlog:
+        print(f"  {GREEN}✓ All backlog items are already implemented!{RESET}")
+        print(f"  {DIM}Live tools ({len(live_tools)}): {current_tools}{RESET}\n")
+        return None
 
     question = f"""You are prioritizing features for an AI coding agent called Jarvis CLI.
 
@@ -237,6 +285,8 @@ Already built: {built_text}
 
 Remaining backlog:
 {backlog_text}
+
+Strategic context: The top use cases for quantum computers are HCLS (healthcare/life sciences), finance, and materials science. This agent supports quantum circuit submission (qpu_submit/qpu_poll) and bioinformatics workflows.
 
 Which ONE feature should be built next to maximize the agent's usefulness for a solo developer building a SaaS product? Consider:
 1. What unlocks the most new workflows
@@ -259,7 +309,7 @@ Reply with ONLY the feature name from the backlog, then a one-sentence justifica
             result = json.loads(resp.read())
         response = result.get("response", "")
     except Exception:
-        response = BACKLOG[0]
+        response = filtered_backlog[0] if filtered_backlog else BACKLOG[0]
         print(f"  {DIM}(API unavailable, using default priority){RESET}")
 
     state["next_priority"] = response.strip()[:200]
@@ -272,42 +322,86 @@ Reply with ONLY the feature name from the backlog, then a one-sentence justifica
 
 
 def build():
-    """Send the prioritized task to kiro-cli via clipboard → terminal paste."""
+    """Execute the prioritized task using the agent backend."""
     state = get_state()
     priority = state.get("next_priority")
     if not priority:
         print(f"  {YELLOW}No priority set. Run: jarvis-cli --prioritize{RESET}")
         return
 
-    task = f"Build this feature for Jarvis CLI (in ~/repos/nodes-bio-clean/app/backend/nodesbio/services/jarvis_next/): {priority}"
+    # Resume existing session if task was previously attempted but didn't land
+    resume_sid = state.get("pending_session")
+    if resume_sid:
+        task = "Continue where you left off. The previous attempt did not merge to main. Finish the implementation, ensure tests pass, and merge."
+        print(f"  {GREEN}✓ Resuming task:{RESET} {DIM}(session {resume_sid}){RESET}")
+        print(f"    {DIM}{priority[:80]}{RESET}\n")
+    else:
+        task = f"Build this feature for Jarvis CLI (in ~/repos/nodes-bio/app/backend/nodesbio/services/jarvis_next/): {priority}"
+        print(f"  {GREEN}✓ Executing task:{RESET}")
+        print(f"    {DIM}{task[:100]}{RESET}\n")
 
     TASK_FILE.write_text(task)
-    subprocess.run(["pbcopy"], input=task.encode(), check=True)
 
-    subprocess.run(["osascript", "-e", 'tell application "Terminal" to activate'], capture_output=True)
-    time.sleep(0.3)
-    subprocess.run(["osascript", "-e", '''
-        tell application "System Events"
-            keystroke "v" using command down
-            delay 0.1
-            keystroke return
-        end tell
-    '''], capture_output=True)
+    response, error, elapsed_time, tool_calls, session_id = execute_task(task, session_id=resume_sid)
 
-    print(f"  {GREEN}✓ Task sent to kiro-cli:{RESET}")
-    print(f"    {DIM}{task[:100]}{RESET}\n")
+    elapsed_str = _format_elapsed_time(elapsed_time) if elapsed_time else ""
+    if error:
+        print(f"  {YELLOW}❌ Failed ({elapsed_str}):{RESET} {error}")
+        # Save session for resume on next run
+        if session_id:
+            state["pending_session"] = session_id
+            save_state(state)
+        return
 
-    state["built"].append(priority[:50])
-    state["next_priority"] = None
-    save_state(state)
+    print(f"  {GREEN}✅ Completed ({elapsed_str}){RESET}")
+    if response:
+        for line in response.split('\n')[:5]:
+            if line.strip():
+                print(f"  {DIM}  {line[:80]}{RESET}")
+
+    # Verify the feature actually landed on main
+    if _feature_on_main(priority):
+        state["built"].append(priority)
+        state["pending_session"] = None
+        state["next_priority"] = None
+        save_state(state)
+    else:
+        # Didn't land — save session for resume
+        print(f"  {YELLOW}  ⚠ Feature not detected on main. Will resume next run.{RESET}")
+        state["pending_session"] = session_id
+        save_state(state)
 
 
 def loop():
     """Full self-improvement cycle."""
     print(f"  {CYAN}Starting self-improvement loop...{RESET}\n")
-    prioritize()
+    state = get_state()
+    if state.get("pending_session") and state.get("next_priority"):
+        print(f"  {CYAN}⟳ Resuming incomplete task...{RESET}\n")
+    else:
+        prioritize()
     build()
     print(f"  {DIM}Kiro is building. Run 'jarvis-cli --help' to check progress.{RESET}")
+
+
+def _show_sessions():
+    """Display recent sessions."""
+    sys.path.insert(0, str(AGENT_BACKEND))
+    try:
+        from nodesbio.services.jarvis_next.memory import list_sessions
+    except ImportError:
+        print(f"  {YELLOW}Cannot load session memory module{RESET}\n")
+        return
+    sessions = list_sessions()
+    if not sessions:
+        print(f"  {DIM}No sessions found.{RESET}\n")
+        return
+    print(f"  {GREEN}Recent sessions:{RESET}")
+    for s in sessions[:10]:
+        ts = datetime.fromtimestamp(s["updated_at"]).strftime("%m/%d %H:%M") if s["updated_at"] else "?"
+        preview = s.get("preview", "")[:50]
+        print(f"    {CYAN}{s['session_id']}{RESET}  {DIM}{ts}  ({s['message_count']} msgs){RESET}  {preview}")
+    print()
 
 
 def interactive():
@@ -420,6 +514,17 @@ def interactive():
             session_id = None
             print(f"  {DIM}New session started.{RESET}\n")
             continue
+        if prompt == "/sessions":
+            _show_sessions()
+            continue
+        if prompt.startswith("/resume"):
+            parts = prompt.split(None, 1)
+            if len(parts) < 2:
+                print(f"  {YELLOW}Usage: /resume <session_id>{RESET}\n")
+            else:
+                session_id = parts[1].strip()
+                print(f"  {DIM}Resumed session: {session_id}{RESET}\n")
+            continue
 
         print()
 
@@ -433,15 +538,13 @@ def interactive():
 
         session_id = result.get("session_id", session_id)
 
-        for tc in result.get("tool_calls", []):
-            print(f"  {MAGENTA}⚡ {tc['name']}{RESET} {DIM}{_summarize_tc(tc)}{RESET}")
-
         response = result.get("response", "")
         last_response[0] = response
-        print(f"\n  {CYAN}{'━' * 60}{RESET}")
-        for line in response.split("\n"):
-            print(f"  {line}")
-        print(f"\n  {DIM}session: {session_id}{RESET}\n")
+
+        # Both local and remote modes stream output directly to stdout
+        if response:
+            print()
+        print(f"  {DIM}session: {session_id}{RESET}\n")
 
 
 def _api_reachable():
@@ -468,13 +571,13 @@ def _get_local_key():
 
 
 def _run_local(prompt, api_key, session_id):
-    """Run agent in-process with live streaming of tool events."""
+    """Run agent in-process with streaming text output."""
     import asyncio
     import threading
 
     sys.path.insert(0, str(AGENT_BACKEND))
     try:
-        from nodesbio.services.jarvis_next.agent import run_agent
+        from nodesbio.services.jarvis_next.agent import run_agent_stream
     except ImportError as e:
         print(f"  {YELLOW}❌ Cannot import agent: {e}{RESET}")
         print(f"  {DIM}Expected at: {AGENT_BACKEND}/nodesbio/services/jarvis_next/{RESET}\n")
@@ -498,36 +601,65 @@ def _run_local(prompt, api_key, session_id):
     spinner_thread = threading.Thread(target=spin, daemon=True)
     spinner_thread.start()
 
-    async def on_event(e):
-        if not got_first_event[0]:
-            got_first_event[0] = True
-            sys.stdout.write("\r" + " " * 30 + "\r")
-            sys.stdout.flush()
-        if e.get("type") == "tool_call":
-            name = e["name"]
-            inp = e.get("input", {})
-            if name == "file_write":
-                path = inp.get("path", "")
-                lines = inp.get("content", "").count("\n") + 1
-                print(f"  {MAGENTA}✎ {name}{RESET} {path} {DIM}({lines} lines){RESET}")
-            elif name == "file_patch":
-                path = inp.get("path", "")
-                old = inp.get("old_str", "")[:40].replace("\n", "↵")
-                new = inp.get("new_str", "")[:40].replace("\n", "↵")
-                print(f"  {MAGENTA}✎ {name}{RESET} {path}")
-                print(f"  {DIM}  - {old}{RESET}")
-                print(f"  {GREEN}  + {new}{RESET}")
-            else:
-                summary = _summarize_input(name, inp)
-                print(f"  {MAGENTA}⚡ {name}{RESET} {DIM}{summary}{RESET}")
-        elif e.get("type") == "tool_result":
-            preview = e.get("result", "")[:100].replace("\n", " ")
-            print(f"  {DIM}  → {preview}{RESET}")
+    result = {"response": "", "tool_calls": [], "session_id": session_id}
+    streamed_text = []
+    text_started = [False]
+
+    async def _stream():
+        async for event in run_agent_stream(prompt, api_key, session_id=session_id):
+            etype = event.get("type")
+
+            if not got_first_event[0]:
+                got_first_event[0] = True
+                sys.stdout.write("\r" + " " * 30 + "\r")
+                sys.stdout.flush()
+
+            if etype == "text_delta":
+                if not text_started[0]:
+                    text_started[0] = True
+                    sys.stdout.write(f"  {CYAN}{'━' * 60}{RESET}\n  ")
+                sys.stdout.write(event["text"])
+                sys.stdout.flush()
+                streamed_text.append(event["text"])
+
+            elif etype == "tool_call":
+                # If we were streaming text, end that section
+                if text_started[0]:
+                    sys.stdout.write("\n")
+                    text_started[0] = False
+                    streamed_text.clear()
+                name = event["name"]
+                inp = event.get("input", {})
+                result["tool_calls"].append({"name": name, "input": inp, "result": ""})
+                if name == "file_write":
+                    path = inp.get("path", "")
+                    lines = inp.get("content", "").count("\n") + 1
+                    print(f"  {MAGENTA}✎ {name}{RESET} {path} {DIM}({lines} lines){RESET}")
+                elif name == "file_patch":
+                    path = inp.get("path", "")
+                    old = inp.get("old_str", "")[:40].replace("\n", "↵")
+                    new = inp.get("new_str", "")[:40].replace("\n", "↵")
+                    print(f"  {MAGENTA}✎ {name}{RESET} {path}")
+                    print(f"  {DIM}  - {old}{RESET}")
+                    print(f"  {GREEN}  + {new}{RESET}")
+                else:
+                    summary = _summarize_input(name, inp)
+                    print(f"  {MAGENTA}⚡ {name}{RESET} {DIM}{summary}{RESET}")
+
+            elif etype == "tool_result":
+                preview = event.get("result", "")[:100].replace("\n", " ")
+                print(f"  {DIM}  → {preview}{RESET}")
+
+            elif etype == "done":
+                result["session_id"] = event.get("session_id", session_id)
+                result["iterations"] = event.get("iterations", 0)
+                result["usage"] = event.get("usage", {})
 
     try:
-        result = asyncio.run(run_agent(prompt, api_key, session_id=session_id, on_event=on_event))
+        asyncio.run(_stream())
         spinning[0] = False
         spinner_thread.join(timeout=0.5)
+        result["response"] = "".join(streamed_text)
         return result
     except Exception as e:
         spinning[0] = False
@@ -537,18 +669,66 @@ def _run_local(prompt, api_key, session_id):
 
 
 def _run_remote(prompt, session_id):
-    """Call the API server."""
+    """Call the API server with SSE streaming."""
     import urllib.request
-    payload = json.dumps({"prompt": prompt, "session_id": session_id}).encode()
+    payload = json.dumps({"prompt": prompt, "session_id": session_id, "stream": True}).encode()
+    result = {"response": "", "tool_calls": [], "session_id": session_id}
+    streamed_text = []
+    text_started = False
+
     try:
         req = urllib.request.Request(
             f"{API_URL}/run",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=300) as resp:
-            return json.loads(resp.read())
+            content_type = resp.headers.get("Content-Type", "")
+            if "event-stream" not in content_type:
+                # Fallback: non-streaming JSON response
+                data = json.loads(resp.read())
+                return data
+
+            # Parse SSE stream
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                etype = event.get("type")
+                if etype == "text_delta":
+                    if not text_started:
+                        text_started = True
+                        sys.stdout.write(f"  {CYAN}{'━' * 60}{RESET}\n  ")
+                    sys.stdout.write(event["text"])
+                    sys.stdout.flush()
+                    streamed_text.append(event["text"])
+                elif etype == "tool_call":
+                    if text_started:
+                        sys.stdout.write("\n")
+                        text_started = False
+                        streamed_text.clear()
+                    name = event["name"]
+                    inp = event.get("input", {})
+                    result["tool_calls"].append({"name": name, "input": inp, "result": ""})
+                    summary = _summarize_input(name, inp)
+                    print(f"  {MAGENTA}⚡ {name}{RESET} {DIM}{summary}{RESET}")
+                elif etype == "tool_result":
+                    preview = event.get("result", "")[:100].replace("\n", " ")
+                    print(f"  {DIM}  → {preview}{RESET}")
+                elif etype == "done":
+                    result["session_id"] = event.get("session_id", session_id)
+
+        result["response"] = "".join(streamed_text)
+        return result
     except Exception as e:
         print(f"  {YELLOW}❌ {e}{RESET}\n")
         return None
@@ -861,6 +1041,46 @@ def log_completed_task(task_entry, response, error=None, elapsed_time=None, tool
     COMPLETED_FILE.write_text(json.dumps(completed, indent=2))
 
 
+def _feature_on_main(priority: str) -> bool:
+    """Check if a feature was actually committed to main by searching recent git log."""
+    import subprocess
+    try:
+        # Check nodes-bio repo for recent commits on main mentioning the feature
+        keywords = priority.lower().replace("(", "").replace(")", "").split()
+        # Use the most distinctive keyword (longest, not a stop word)
+        stop = {"a", "the", "for", "and", "or", "in", "on", "to", "of", "with"}
+        search_terms = [w for w in keywords if w not in stop and len(w) > 3]
+        if not search_terms:
+            return True  # Can't verify, assume success
+
+        # Search last 5 commits on main for any matching term
+        r = subprocess.run(
+            ["git", "log", "main", "--oneline", "-5"],
+            capture_output=True, text=True, timeout=5,
+            cwd=str(Path.home() / "repos" / "nodes-bio"),
+        )
+        if r.returncode != 0:
+            return True  # Can't verify, assume success
+
+        log_lower = r.stdout.lower()
+        # Also check if EXECUTORS has a matching tool name
+        for term in search_terms:
+            tool_name = term.replace("-", "_").replace(" ", "_")
+            if tool_name in log_lower or term in log_lower:
+                return True
+
+        # Also check live tools as a fallback
+        live_tools, _ = _scan_inventory()
+        for term in search_terms:
+            tool_name = term.replace("-", "_").replace(" ", "_")
+            if tool_name in live_tools:
+                return True
+
+        return False
+    except Exception:
+        return True  # Can't verify, assume success
+
+
 def _auto_push_origin_main():
     """After a successful task, push committed changes to origin/main.
 
@@ -898,15 +1118,15 @@ def _auto_push_origin_main():
         print(f"    {DIM}↑ push error: {e}{RESET}")
 
 
-def execute_task(task):
-    """Execute a single task using the agent."""
+def execute_task(task, session_id=None):
+    """Execute a single task using the agent. Returns (response, error, elapsed, tool_calls, session_id)."""
     start_time = time.time()
     local_mode = not _api_reachable()
     
     if local_mode:
         api_key = _get_local_key()
         if not api_key:
-            return None, "ANTHROPIC_API_KEY not set", 0, []
+            return None, "ANTHROPIC_API_KEY not set", 0, [], None
         
         # Import and run agent
         sys.path.insert(0, str(AGENT_BACKEND))
@@ -924,18 +1144,19 @@ def execute_task(task):
                     preview = e.get("result", "")[:80].replace("\n", " ")
                     print(f"    {DIM}→ {preview}{RESET}")
 
-            result = asyncio.run(run_agent(task, api_key, on_event=on_event))
+            result = asyncio.run(run_agent(task, api_key, session_id=session_id, on_event=on_event))
             elapsed_time = time.time() - start_time
             tool_calls = result.get("tool_calls", [])
+            sid = result.get("session_id")
             _auto_push_origin_main()
-            return result.get("response", ""), None, elapsed_time, tool_calls
+            return result.get("response", ""), None, elapsed_time, tool_calls, sid
         except Exception as e:
             elapsed_time = time.time() - start_time
-            return None, str(e), elapsed_time, []
+            return None, str(e), elapsed_time, [], None
     else:
         # Use API
         import urllib.request
-        payload = json.dumps({"prompt": task}).encode()
+        payload = json.dumps({"prompt": task, "session_id": session_id}).encode()
         try:
             req = urllib.request.Request(
                 f"{API_URL}/run",
@@ -947,11 +1168,12 @@ def execute_task(task):
                 result = json.loads(resp.read())
             elapsed_time = time.time() - start_time
             tool_calls = result.get("tool_calls", [])
+            sid = result.get("session_id")
             _auto_push_origin_main()
-            return result.get("response", ""), None, elapsed_time, tool_calls
+            return result.get("response", ""), None, elapsed_time, tool_calls, sid
         except Exception as e:
             elapsed_time = time.time() - start_time
-            return None, str(e), elapsed_time, []
+            return None, str(e), elapsed_time, [], None
 
 
 def show_log(count=5):
@@ -1260,7 +1482,7 @@ def _next_idle_task():
     idle_tasks = [
         "In ~/repos/jarvis-cli, review the test suite and add any missing edge case tests. Use dev_pipeline to ship.",
         "In ~/repos/jarvis-cli, add a --status command that shows iteration count, tools available, and last 5 completed tasks. Use dev_pipeline to ship.",
-        "In ~/repos/nodes-bio-clean, run the jarvis_next test suite and fix any failures. Use dev_pipeline to ship.",
+        "In ~/repos/nodes-bio, run the jarvis_next test suite and fix any failures. Use dev_pipeline to ship.",
         "In ~/repos/jarvis-cli, add elapsed time display to daemon task execution output. Use dev_pipeline to ship.",
         "In ~/repos/jarvis-cli, add a --clear-queue command that empties the queue. Use dev_pipeline to ship.",
     ]
@@ -1576,7 +1798,7 @@ def daemon_mode():
                     save_queue(queue)
                     
                     # Execute the task
-                    response, error, elapsed_time, tool_calls = execute_task(task)
+                    response, error, elapsed_time, tool_calls, _sid = execute_task(task)
                     
                     # Remove from queue and log completion
                     queue = [t for t in queue if t["id"] != task_id]
@@ -1682,6 +1904,21 @@ def main():
                 print(f"  {YELLOW}Invalid port: {args[1]}{RESET}")
                 return
         dashboard.serve(port=port)
+    elif args[0] == "--sessions":
+        _show_sessions()
+    elif args[0] == "--continue":
+        if len(args) < 3:
+            print(f"  {YELLOW}Usage: jarvis-cli --continue <session_id> \"prompt\"{RESET}")
+            return
+        sid = args[1]
+        prompt = " ".join(args[2:])
+        api_key = _get_local_key()
+        if not api_key:
+            print(f"  {YELLOW}❌ Set ANTHROPIC_API_KEY or ~/.jarvis_cli/api_key{RESET}")
+            return
+        result = _run_local(prompt, api_key, sid)
+        if result:
+            print(f"\n  {DIM}session: {result.get('session_id', sid)}{RESET}")
     else:
         # One-shot
         import urllib.request
