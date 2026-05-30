@@ -497,31 +497,41 @@ def interactive():
     last_interrupt = [0.0]
 
     def _read_multiline_input():
-        """Read input, supporting pasted multi-line blocks.
+        """Read input with multi-line support.
         
-        After the first line, checks if more data is available on stdin
-        within a short timeout (paste detection). Continues reading until
-        no more data arrives or an empty line is entered.
+        Start with triple-quotes or triple-backticks for multi-line mode.
+        Use trailing backslash for line continuation.
         """
-        import select
         first_line = input(f"  {GREEN}❯{RESET} ")
+        
+        # Explicit multi-line mode: start with """ or '''
+        if first_line.strip() in ('"""', "'''", '```'):
+            delimiter = first_line.strip()
+            print(f"  {DIM}(multi-line mode, end with {delimiter}){RESET}")
+            lines = []
+            while True:
+                try:
+                    line = input(f"  {DIM}…{RESET} ")
+                    if line.strip() == delimiter:
+                        break
+                    lines.append(line)
+                except EOFError:
+                    break
+            result = '\n'.join(lines).strip()
+            if lines:
+                print(f"  {DIM}({len(lines)} lines){RESET}")
+            return result
+        
+        # Line continuation with trailing backslash
         lines = [first_line]
-        
-        # Check if more lines are being pasted (data available immediately)
-        while True:
-            # Wait briefly for more input (paste arrives all at once)
-            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if not ready:
+        while lines[-1].endswith('\\'):
+            lines[-1] = lines[-1][:-1]  # strip the backslash
+            try:
+                lines.append(input(f"  {DIM}…{RESET} "))
+            except EOFError:
                 break
-            line = sys.stdin.readline()
-            if not line:  # EOF
-                break
-            lines.append(line.rstrip('\n'))
         
-        result = '\n'.join(lines).strip()
-        if len(lines) > 1:
-            print(f"  {DIM}({len(lines)} lines pasted){RESET}")
-        return result
+        return '\n'.join(lines).strip()
 
     while True:
         try:
