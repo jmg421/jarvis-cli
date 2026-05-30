@@ -357,7 +357,7 @@ def build():
     if response:
         for line in response.split('\n')[:5]:
             if line.strip():
-                print(f"  {DIM}  {line[:80]}{RESET}")
+                print(f"  {DIM}  {line[:200]}{RESET}")
 
     # Verify the feature actually landed on main
     if _feature_on_main(priority):
@@ -494,6 +494,8 @@ def interactive():
   {DIM}Multi-turn memory active. /new for fresh session.{RESET}
 """)
 
+    last_interrupt = [0.0]
+
     while True:
         try:
             if prompt_queue:
@@ -501,10 +503,17 @@ def interactive():
                 print(f"  {GREEN}❯{RESET} {DIM}(stream deck){RESET} {prompt}")
             else:
                 prompt = input(f"  {GREEN}❯{RESET} ").strip()
+            last_interrupt[0] = 0.0  # Reset on successful input
         except (EOFError, KeyboardInterrupt):
-            readline.write_history_file(histfile)
-            print(f"\n\n  {DIM}Goodbye.{RESET}\n")
-            break
+            now = time.time()
+            if now - last_interrupt[0] < 1.0:
+                # Double Ctrl-C — hard exit
+                readline.write_history_file(histfile)
+                print(f"\n\n  {DIM}Goodbye.{RESET}\n")
+                break
+            last_interrupt[0] = now
+            print(f"\n  {DIM}(Ctrl-C again to exit){RESET}")
+            continue
         if not prompt:
             continue
         if prompt in ("/quit", "/exit", "/q"):
@@ -574,6 +583,7 @@ def _run_local(prompt, api_key, session_id):
     """Run agent in-process with streaming text output."""
     import asyncio
     import threading
+    import signal
 
     sys.path.insert(0, str(AGENT_BACKEND))
     try:
@@ -586,6 +596,7 @@ def _run_local(prompt, api_key, session_id):
     SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     spinning = [True]
     got_first_event = [False]
+    cancelled = [False]
 
     def spin():
         i = 0
@@ -607,6 +618,8 @@ def _run_local(prompt, api_key, session_id):
 
     async def _stream():
         async for event in run_agent_stream(prompt, api_key, session_id=session_id):
+            if cancelled[0]:
+                break
             etype = event.get("type")
 
             if not got_first_event[0]:
@@ -637,8 +650,8 @@ def _run_local(prompt, api_key, session_id):
                     print(f"  {MAGENTA}✎ {name}{RESET} {path} {DIM}({lines} lines){RESET}")
                 elif name == "file_patch":
                     path = inp.get("path", "")
-                    old = inp.get("old_str", "")[:40].replace("\n", "↵")
-                    new = inp.get("new_str", "")[:40].replace("\n", "↵")
+                    old = inp.get("old_str", "")[:80].replace("\n", "↵")
+                    new = inp.get("new_str", "")[:80].replace("\n", "↵")
                     print(f"  {MAGENTA}✎ {name}{RESET} {path}")
                     print(f"  {DIM}  - {old}{RESET}")
                     print(f"  {GREEN}  + {new}{RESET}")
@@ -647,7 +660,7 @@ def _run_local(prompt, api_key, session_id):
                     print(f"  {MAGENTA}⚡ {name}{RESET} {DIM}{summary}{RESET}")
 
             elif etype == "tool_result":
-                preview = event.get("result", "")[:100].replace("\n", " ")
+                preview = event.get("result", "")[:200].replace("\n", " ")
                 print(f"  {DIM}  → {preview}{RESET}")
 
             elif etype == "done":
@@ -659,6 +672,20 @@ def _run_local(prompt, api_key, session_id):
         asyncio.run(_stream())
         spinning[0] = False
         spinner_thread.join(timeout=0.5)
+        if cancelled[0]:
+            if text_started[0]:
+                sys.stdout.write("\n")
+            print(f"\n  {YELLOW}⚡ Cancelled{RESET}\n")
+        result["response"] = "".join(streamed_text)
+        return result
+    except KeyboardInterrupt:
+        # First Ctrl-C during generation = soft cancel
+        cancelled[0] = True
+        spinning[0] = False
+        spinner_thread.join(timeout=0.5)
+        if text_started[0]:
+            sys.stdout.write("\n")
+        print(f"\n  {YELLOW}⚡ Cancelled (Ctrl-C again within 1s to exit){RESET}\n")
         result["response"] = "".join(streamed_text)
         return result
     except Exception as e:
@@ -722,7 +749,7 @@ def _run_remote(prompt, session_id):
                     summary = _summarize_input(name, inp)
                     print(f"  {MAGENTA}⚡ {name}{RESET} {DIM}{summary}{RESET}")
                 elif etype == "tool_result":
-                    preview = event.get("result", "")[:100].replace("\n", " ")
+                    preview = event.get("result", "")[:200].replace("\n", " ")
                     print(f"  {DIM}  → {preview}{RESET}")
                 elif etype == "done":
                     result["session_id"] = event.get("session_id", session_id)
@@ -738,7 +765,7 @@ def _summarize_input(name, inp):
     if name == "file_read":
         return inp.get("path", "")
     elif name == "execute_bash":
-        return inp.get("command", "")[:80]
+        return inp.get("command", "")[:200]
     elif name == "glob_search":
         return inp.get("pattern", "")
     elif name == "grep_search":
@@ -752,8 +779,8 @@ def _summarize_input(name, inp):
     elif name == "git":
         return inp.get("args", "")
     elif name == "synthesize":
-        return inp.get("question", "")[:60]
-    return str(inp)[:60]
+        return inp.get("question", "")[:200]
+    return str(inp)[:200]
 
 
 def _summarize_tc(tc):
@@ -1141,7 +1168,7 @@ def execute_task(task, session_id=None):
                     summary = _summarize_input(name, inp)
                     print(f"    {MAGENTA}⚡ {name}{RESET} {DIM}{summary}{RESET}")
                 elif e.get("type") == "tool_result":
-                    preview = e.get("result", "")[:80].replace("\n", " ")
+                    preview = e.get("result", "")[:200].replace("\n", " ")
                     print(f"    {DIM}→ {preview}{RESET}")
 
             result = asyncio.run(run_agent(task, api_key, session_id=session_id, on_event=on_event))
@@ -1815,7 +1842,7 @@ def daemon_mode():
                             lines = response.split('\n')[:3]
                             for line in lines:
                                 if line.strip():
-                                    print(f"  {DIM}  {line[:80]}{RESET}")
+                                    print(f"  {DIM}  {line[:200]}{RESET}")
                             if len(response.split('\n')) > 3:
                                 print(f"  {DIM}  ... (response logged){RESET}")
                     print()
