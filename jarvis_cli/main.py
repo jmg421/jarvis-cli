@@ -496,13 +496,40 @@ def interactive():
 
     last_interrupt = [0.0]
 
+    def _read_multiline_input():
+        """Read input, supporting pasted multi-line blocks.
+        
+        After the first line, checks if more data is available on stdin
+        within a short timeout (paste detection). Continues reading until
+        no more data arrives or an empty line is entered.
+        """
+        import select
+        first_line = input(f"  {GREEN}❯{RESET} ")
+        lines = [first_line]
+        
+        # Check if more lines are being pasted (data available immediately)
+        while True:
+            # Wait briefly for more input (paste arrives all at once)
+            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if not ready:
+                break
+            line = sys.stdin.readline()
+            if not line:  # EOF
+                break
+            lines.append(line.rstrip('\n'))
+        
+        result = '\n'.join(lines).strip()
+        if len(lines) > 1:
+            print(f"  {DIM}({len(lines)} lines pasted){RESET}")
+        return result
+
     while True:
         try:
             if prompt_queue:
                 prompt = prompt_queue.pop(0)
                 print(f"  {GREEN}❯{RESET} {DIM}(stream deck){RESET} {prompt}")
             else:
-                prompt = input(f"  {GREEN}❯{RESET} ").strip()
+                prompt = _read_multiline_input()
             last_interrupt[0] = 0.0  # Reset on successful input
         except (EOFError, KeyboardInterrupt):
             now = time.time()
@@ -1824,8 +1851,9 @@ def daemon_mode():
                             break
                     save_queue(queue)
                     
-                    # Execute the task
-                    response, error, elapsed_time, tool_calls, _sid = execute_task(task)
+                    # Execute the task (wrap with action directive to prevent narration)
+                    action_task = f"Execute this task completely using tools. Do NOT narrate what you plan to do — just do it. If the task asks you to write a file, call file_write immediately after gathering context. Task: {task}"
+                    response, error, elapsed_time, tool_calls, _sid = execute_task(action_task)
                     
                     # Remove from queue and log completion
                     queue = [t for t in queue if t["id"] != task_id]
