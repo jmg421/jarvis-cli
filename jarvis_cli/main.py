@@ -474,6 +474,9 @@ def interactive():
     session_id = None
     local_mode = not _api_reachable()
 
+    # Initialize bracketed paste support
+    _enable_bracketed_paste()
+
     if local_mode:
         print(f"  {YELLOW}● Local mode{RESET} {DIM}(API unreachable, running in-process){RESET}")
         api_key = _get_local_key()
@@ -497,21 +500,53 @@ def interactive():
 
     last_interrupt = [0.0]
 
+    def _enable_bracketed_paste():
+        """Enable bracketed paste mode for better paste handling."""
+        try:
+            # Enable bracketed paste mode (if terminal supports it)
+            sys.stdout.write("\033[?2004h")
+            sys.stdout.flush()
+        except:
+            pass
+    
+    def _disable_bracketed_paste():
+        """Disable bracketed paste mode."""
+        try:
+            sys.stdout.write("\033[?2004l") 
+            sys.stdout.flush()
+        except:
+            pass
+
     def _read_multiline_input():
-        """Read input with multi-line support.
+        """Read input with multi-line support and robust paste handling.
         
         Supports multiple input modes:
         1. Automatic detection of pasted multiline content (contains newlines)
         2. Explicit multi-line mode: start with triple quotes
         3. Line continuation with trailing backslash
         4. Empty line to continue multiline input
+        5. Robust inline paste handling (preserves typed prompt + pasted content)
         """
         try:
+            # Enable bracketed paste for better handling of mixed typed/pasted input
+            _enable_bracketed_paste()
+            
             first_line = input(f"  {GREEN}❯{RESET} ")
             
-            # Check if the input already contains newlines (pasted content)
+            # Clean up bracketed paste markers if present
+            if first_line.startswith('\033[200~') and first_line.endswith('\033[201~'):
+                # Remove bracketed paste markers
+                first_line = first_line[6:-6]
+                print(f"  {DIM}(cleaned paste markers){RESET}")
+            
+            # Debug: show what we actually received for long inputs
+            if len(first_line) > 100:
+                print(f"  {DIM}(received {len(first_line)} chars){RESET}")
+            
+            # Check if the input contains newlines (multiline pasted content)
             if '\n' in first_line:
-                print(f"  {DIM}(detected multiline paste: {len(first_line.splitlines())} lines){RESET}")
+                lines = first_line.splitlines()
+                print(f"  {DIM}(detected multiline paste: {len(lines)} lines){RESET}")
                 return first_line.strip()
             
             # Explicit multi-line mode: start with triple quotes
@@ -564,6 +599,9 @@ def interactive():
         except Exception as e:
             print(f"  {YELLOW}Input error: {e}{RESET}")
             return ""
+        finally:
+            # Always disable bracketed paste when done
+            _disable_bracketed_paste()
 
     while True:
         try:
@@ -578,6 +616,7 @@ def interactive():
             if now - last_interrupt[0] < 1.0:
                 # Double Ctrl-C — hard exit
                 readline.write_history_file(histfile)
+                _disable_bracketed_paste()
                 print(f"\n\n  {DIM}Goodbye.{RESET}\n")
                 break
             last_interrupt[0] = now
@@ -587,6 +626,7 @@ def interactive():
             continue
         if prompt in ("/quit", "/exit", "/q"):
             readline.write_history_file(histfile)
+            _disable_bracketed_paste()
             break
         if prompt == "/new":
             session_id = None

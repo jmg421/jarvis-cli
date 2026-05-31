@@ -1,4 +1,3 @@
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -16,38 +15,28 @@ parts/
 sdist/
 var/
 wheels/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# Virtual environments
-venv/
+MANIFEST
+.env
+.venv
 env/
+venv/
 ENV/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-agent_logs/
-
-# Temporary files
-.temp/
-temp/
-tmp/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Test coverage
-.coverage
-htmlcov/
+env.bak/
+venv.bak/
 .pytest_cache/
+.coverage
+.nyc_output
+.idea/
+.vscode/
+
+# Rust
+target/
+Cargo.lock
+
+# Test files
+test_*.py
+debug_*.py
