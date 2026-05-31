@@ -1,6 +1,8 @@
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio::time::timeout;
 
 use crate::render;
 
@@ -47,7 +49,14 @@ pub async fn stream(url: &str, prompt: &str, session_id: Option<&str>, api_key: 
     let mut buffer = String::new();
     let mut final_session_id = session_id.unwrap_or("unknown").to_string();
 
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = match timeout(Duration::from_secs(120), stream.next()).await {
+        Ok(Some(chunk)) => Some(chunk),
+        Ok(None) => None,
+        Err(_) => {
+            render::finish();
+            return Err("Stream timeout: no data for 120s".to_string());
+        }
+    } {
         let chunk = chunk.map_err(|e| format!("Stream error: {e}"))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
