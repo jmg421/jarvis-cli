@@ -152,7 +152,7 @@ def show_help():
 
     print(f"""
   {GREEN}Commands:{RESET}
-    jarvis-cli                 Interactive agent mode
+    jarvis-cli                 Interactive agent mode (improved Ctrl-C handling)
     jarvis-cli --help          Show this + trigger priority loop
     jarvis-cli --prioritize    Synthesize next feature priority
     jarvis-cli --build         Send priority to kiro-cli for building
@@ -170,6 +170,10 @@ def show_help():
     jarvis-cli --dashboard [port] Serve dashboard (default port 7294)
     jarvis-cli --sessions      List recent conversation sessions
     jarvis-cli --continue <id> "prompt"  Continue an existing session
+
+  {GREEN}Pattern Interrupts:{RESET}
+    {CYAN}Ctrl-C once{RESET}         Cancel current operation (input/generation)
+    {CYAN}Ctrl-C twice (2s){RESET}    Exit gracefully
 """)
 
 
@@ -405,9 +409,39 @@ def _show_sessions():
 
 
 def interactive():
-    """Interactive agent mode with multi-turn memory."""
+    """Interactive agent mode with multi-turn memory and improved Ctrl-C handling."""
     import urllib.request
     import threading
+
+    # Set up graceful interrupt handling
+    interrupt_count = [0]
+    interrupt_time = [0.0]
+    cancelled = [False]
+    
+    def signal_handler(signum, frame):
+        """Handle Ctrl-C with different behaviors based on context."""
+        current_time = time.time()
+        interrupt_count[0] += 1
+        
+        # Reset counter if more than 2 seconds since last interrupt
+        if current_time - interrupt_time[0] > 2.0:
+            interrupt_count[0] = 1
+            
+        interrupt_time[0] = current_time
+        
+        if interrupt_count[0] == 1:
+            print(f"\n  {YELLOW}⚡ Interrupt received - press Ctrl-C again within 2s to exit{RESET}")
+            cancelled[0] = True
+        elif interrupt_count[0] >= 2:
+            print(f"\n  {DIM}Exiting gracefully...{RESET}")
+            try:
+                readline.write_history_file(histfile)
+            except:
+                pass
+            sys.exit(0)
+    
+    # Install signal handler
+    signal.signal(signal.SIGINT, signal_handler)
 
     histfile = Path.home() / ".jarvis_cli" / "history"
     histfile.parent.mkdir(parents=True, exist_ok=True)
@@ -496,9 +530,8 @@ def interactive():
   {DIM}cwd: {os.getcwd()}{RESET}
   {DIM}Multi-turn memory active. /new for fresh session.{RESET}
   {DIM}Multiline: paste directly, use triple quotes or empty line, or \\ continuation{RESET}
+  {DIM}Improved interrupts: Ctrl-C once cancels operation, twice exits{RESET}
 """)
-
-    last_interrupt = [0.0]
 
     def _enable_bracketed_paste():
         """Enable bracketed paste mode for better paste handling."""
@@ -518,7 +551,7 @@ def interactive():
             pass
 
     def _read_multiline_input():
-        """Read input with multi-line support and robust paste handling.
+        """Read input with multi-line support and improved interrupt handling.
         
         Supports multiple input modes:
         1. Automatic detection of pasted multiline content (contains newlines)
@@ -526,12 +559,21 @@ def interactive():
         3. Line continuation with trailing backslash
         4. Empty line to continue multiline input
         5. Robust inline paste handling (preserves typed prompt + pasted content)
+        6. Graceful Ctrl-C handling during input
         """
         try:
             # Enable bracketed paste for better handling of mixed typed/pasted input
             _enable_bracketed_paste()
             
+            # Check for cancellation before reading input
+            if cancelled[0]:
+                return ""
+            
             first_line = input(f"  {GREEN}❯{RESET} ")
+            
+            # Check for cancellation after input
+            if cancelled[0]:
+                return ""
             
             # Clean up bracketed paste markers if present
             if first_line.startswith('\033[200~') and first_line.endswith('\033[201~'):
@@ -556,16 +598,19 @@ def interactive():
                 lines = []
                 while True:
                     try:
+                        if cancelled[0]:
+                            print(f"  {DIM}Multi-line input cancelled{RESET}")
+                            return ""
                         line = input(f"  {DIM}…{RESET} ")
                         if line.strip() == delimiter:
                             break
                         lines.append(line)
-                    except EOFError:
+                    except (EOFError, KeyboardInterrupt):
                         break
                 result = '\n'.join(lines).strip()
-                if lines:
+                if lines and not cancelled[0]:
                     print(f"  {DIM}({len(lines)} lines){RESET}")
-                return result
+                return result if not cancelled[0] else ""
             
             # Check for empty line to start multiline input mode
             if not first_line.strip():
@@ -573,29 +618,35 @@ def interactive():
                 lines = []
                 while True:
                     try:
+                        if cancelled[0]:
+                            print(f"  {DIM}Multi-line input cancelled{RESET}")
+                            return ""
                         line = input(f"  {DIM}…{RESET} ")
                         if not line.strip():  # Empty line ends multiline input
                             break
                         lines.append(line)
-                    except EOFError:
+                    except (EOFError, KeyboardInterrupt):
                         break
                 result = '\n'.join(lines).strip()
-                if lines:
+                if lines and not cancelled[0]:
                     print(f"  {DIM}({len(lines)} lines){RESET}")
-                return result
+                return result if not cancelled[0] else ""
             
             # Line continuation with trailing backslash
             lines = [first_line]
-            while lines and lines[-1].endswith('\\'):
+            while lines and lines[-1].endswith('\\') and not cancelled[0]:
                 lines[-1] = lines[-1][:-1]  # strip the backslash
                 try:
                     continuation = input(f"  {DIM}…{RESET} ")
                     lines.append(continuation)
-                except EOFError:
+                except (EOFError, KeyboardInterrupt):
                     break
             
-            return '\n'.join(lines).strip()
+            return '\n'.join(lines).strip() if not cancelled[0] else ""
             
+        except KeyboardInterrupt:
+            # Let signal handler manage this
+            return ""
         except Exception as e:
             print(f"  {YELLOW}Input error: {e}{RESET}")
             return ""
@@ -605,22 +656,26 @@ def interactive():
 
     while True:
         try:
+            # Reset cancellation flag for each new input
+            cancelled[0] = False
+            interrupt_count[0] = 0
+            
             if prompt_queue:
                 prompt = prompt_queue.pop(0)
                 print(f"  {GREEN}❯{RESET} {DIM}(stream deck){RESET} {prompt}")
             else:
                 prompt = _read_multiline_input()
-            last_interrupt[0] = 0.0  # Reset on successful input
+                
+            # Check if cancelled during input
+            if cancelled[0]:
+                print(f"  {DIM}Input cancelled{RESET}")
+                continue
+                
         except (EOFError, KeyboardInterrupt):
-            now = time.time()
-            if now - last_interrupt[0] < 1.0:
-                # Double Ctrl-C — hard exit
-                readline.write_history_file(histfile)
-                _disable_bracketed_paste()
-                print(f"\n\n  {DIM}Goodbye.{RESET}\n")
-                break
-            last_interrupt[0] = now
-            print(f"\n  {DIM}(Ctrl-C again to exit){RESET}")
+            # This catches Ctrl-C during input() - let signal handler manage it
+            continue
+        except Exception as e:
+            print(f"  {YELLOW}Input error: {e}{RESET}")
             continue
         if not prompt:
             continue
@@ -646,12 +701,16 @@ def interactive():
 
         print()
 
+        # Check for cancellation before processing
+        if cancelled[0]:
+            continue
+            
         if local_mode:
-            result = _run_local(prompt, api_key, session_id)
+            result = _run_local(prompt, api_key, session_id, cancelled)
         else:
-            result = _run_remote(prompt, session_id)
+            result = _run_remote(prompt, session_id, cancelled)
 
-        if not result:
+        if not result or cancelled[0]:
             continue
 
         session_id = result.get("session_id", session_id)
@@ -688,11 +747,13 @@ def _get_local_key():
     return None
 
 
-def _run_local(prompt, api_key, session_id):
-    """Run agent in-process with streaming text output."""
+def _run_local(prompt, api_key, session_id, cancelled_flag=None):
+    """Run agent in-process with streaming text output and cancellation support."""
     import asyncio
     import threading
-    import signal
+
+    if cancelled_flag is None:
+        cancelled_flag = [False]
 
     sys.path.insert(0, str(AGENT_BACKEND))
     try:
@@ -705,7 +766,7 @@ def _run_local(prompt, api_key, session_id):
     SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     spinning = [True]
     got_first_event = [False]
-    cancelled = [False]
+    local_cancelled = [False]
 
     def spin():
         i = 0
@@ -729,7 +790,8 @@ def _run_local(prompt, api_key, session_id):
 
     async def _stream():
         async for event in run_agent_stream(prompt, api_key, session_id=session_id):
-            if cancelled[0]:
+            # Check both local and global cancellation flags
+            if local_cancelled[0] or cancelled_flag[0]:
                 break
             etype = event.get("type")
 
@@ -787,18 +849,18 @@ def _run_local(prompt, api_key, session_id):
         if text_started[0]:
             sys.stdout.write("\n")
             sys.stdout.flush()
-        if cancelled[0]:
+        if local_cancelled[0] or cancelled_flag[0]:
             print(f"\n  {YELLOW}⚡ Cancelled{RESET}\n")
         result["response"] = "".join(streamed_text)
         return result
     except KeyboardInterrupt:
-        # First Ctrl-C during generation = soft cancel
-        cancelled[0] = True
+        # Ctrl-C during generation sets local cancellation flag
+        local_cancelled[0] = True
         spinning[0] = False
         spinner_thread.join(timeout=0.5)
         if text_started[0]:
             sys.stdout.write("\n")
-        print(f"\n  {YELLOW}⚡ Cancelled (Ctrl-C again within 1s to exit){RESET}\n")
+        print(f"\n  {YELLOW}⚡ Generation cancelled{RESET}\n")
         result["response"] = "".join(streamed_text)
         return result
     except Exception as e:
@@ -808,9 +870,13 @@ def _run_local(prompt, api_key, session_id):
         return None
 
 
-def _run_remote(prompt, session_id):
-    """Call the API server with SSE streaming."""
+def _run_remote(prompt, session_id, cancelled_flag=None):
+    """Call the API server with SSE streaming and cancellation support."""
     import urllib.request
+    
+    if cancelled_flag is None:
+        cancelled_flag = [False]
+        
     payload = json.dumps({"prompt": prompt, "session_id": session_id, "stream": True}).encode()
     result = {"response": "", "tool_calls": [], "session_id": session_id}
     streamed_text = []
@@ -832,6 +898,11 @@ def _run_remote(prompt, session_id):
 
             # Parse SSE stream
             for raw_line in resp:
+                # Check for cancellation during streaming
+                if cancelled_flag[0]:
+                    print(f"\n  {YELLOW}⚡ Remote streaming cancelled{RESET}")
+                    break
+                    
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data: "):
                     continue
@@ -1890,10 +1961,16 @@ def daemon_mode():
 """)
     
     # Set up signal handlers for clean shutdown
+    shutdown_requested = [False]
+    
     def signal_handler(signum, frame):
-        print(f"\n  {YELLOW}Shutting down daemon...{RESET}")
-        DAEMON_PID_FILE.unlink(missing_ok=True)
-        sys.exit(0)
+        if not shutdown_requested[0]:
+            print(f"\n  {YELLOW}Graceful shutdown requested... (Ctrl-C again to force){RESET}")
+            shutdown_requested[0] = True
+        else:
+            print(f"\n  {YELLOW}Forcing shutdown...{RESET}")
+            DAEMON_PID_FILE.unlink(missing_ok=True)
+            sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -1901,7 +1978,7 @@ def daemon_mode():
     last_queue_check = 0
     
     try:
-        while True:
+        while not shutdown_requested[0]:
             current_time = time.time()
             
             # Check queue every 2 seconds
@@ -1970,111 +2047,119 @@ def daemon_mode():
 
 
 def main():
-    args = sys.argv[1:]
+    """Main entry point with improved signal handling."""
+    try:
+        args = sys.argv[1:]
 
-    if not args:
-        interactive()
-    elif args[0] in ("-h", "--help"):
-        show_help()
-    elif args[0] == "--status":
-        status()
-    elif args[0] == "--prioritize":
-        prioritize()
-    elif args[0] == "--build":
-        build()
-    elif args[0] == "--loop":
-        loop()
-    elif args[0] == "--daemon":
-        daemon_mode()
-    elif args[0] == "--daemon-status":
-        daemon_status()
-    elif args[0] == "--clear-queue":
-        clear_queue()
-    elif args[0] == "--replay":
-        replay_last_task()
-    elif args[0] == "--enqueue":
-        if len(args) < 2:
-            print(f"  {YELLOW}Usage: jarvis-cli --enqueue \"task description\"{RESET}")
-            return
-        task = " ".join(args[1:])
-        enqueue_task(task)
-    elif args[0] == "--index":
-        if len(args) < 2:
-            print(f"  {YELLOW}Usage: jarvis-cli --index <directory>{RESET}")
-            return
-        directory = args[1]
-        codebase_index(directory)
-    elif args[0] == "--index-force":
-        if len(args) < 2:
-            print(f"  {YELLOW}Usage: jarvis-cli --index-force <directory>{RESET}")
-            return
-        directory = args[1]
-        codebase_index(directory, force_rebuild=True)
-    elif args[0] == "--log":
-        count = 5  # default
-        if len(args) > 1:
-            try:
-                count = int(args[1])
-                if count <= 0:
-                    print(f"  {YELLOW}Count must be a positive integer{RESET}")
+        if not args:
+            interactive()
+        elif args[0] in ("-h", "--help"):
+            show_help()
+        elif args[0] == "--status":
+            status()
+        elif args[0] == "--prioritize":
+            prioritize()
+        elif args[0] == "--build":
+            build()
+        elif args[0] == "--loop":
+            loop()
+        elif args[0] == "--daemon":
+            daemon_mode()
+        elif args[0] == "--daemon-status":
+            daemon_status()
+        elif args[0] == "--clear-queue":
+            clear_queue()
+        elif args[0] == "--replay":
+            replay_last_task()
+        elif args[0] == "--enqueue":
+            if len(args) < 2:
+                print(f"  {YELLOW}Usage: jarvis-cli --enqueue \"task description\"{RESET}")
+                return
+            task = " ".join(args[1:])
+            enqueue_task(task)
+        elif args[0] == "--index":
+            if len(args) < 2:
+                print(f"  {YELLOW}Usage: jarvis-cli --index <directory>{RESET}")
+                return
+            directory = args[1]
+            codebase_index(directory)
+        elif args[0] == "--index-force":
+            if len(args) < 2:
+                print(f"  {YELLOW}Usage: jarvis-cli --index-force <directory>{RESET}")
+                return
+            directory = args[1]
+            codebase_index(directory, force_rebuild=True)
+        elif args[0] == "--log":
+            count = 5  # default
+            if len(args) > 1:
+                try:
+                    count = int(args[1])
+                    if count <= 0:
+                        print(f"  {YELLOW}Count must be a positive integer{RESET}")
+                        return
+                except ValueError:
+                    print(f"  {YELLOW}Invalid count: {args[1]}. Must be a number.{RESET}")
                     return
-            except ValueError:
-                print(f"  {YELLOW}Invalid count: {args[1]}. Must be a number.{RESET}")
-                return
-        show_log(count)
-    elif args[0] == "--watch":
-        directory = args[1] if len(args) > 1 else "."
-        interval = 1.0
-        if len(args) > 2:
-            try:
-                interval = float(args[2])
-                if interval <= 0:
-                    print(f"  {YELLOW}Interval must be > 0{RESET}")
+            show_log(count)
+        elif args[0] == "--watch":
+            directory = args[1] if len(args) > 1 else "."
+            interval = 1.0
+            if len(args) > 2:
+                try:
+                    interval = float(args[2])
+                    if interval <= 0:
+                        print(f"  {YELLOW}Interval must be > 0{RESET}")
+                        return
+                except ValueError:
+                    print(f"  {YELLOW}Invalid interval: {args[2]}{RESET}")
                     return
-            except ValueError:
-                print(f"  {YELLOW}Invalid interval: {args[2]}{RESET}")
+            watch_directory(directory, interval)
+        elif args[0] == "--dashboard":
+            from jarvis_cli import dashboard
+            port = dashboard.DEFAULT_PORT
+            if len(args) > 1:
+                try:
+                    port = int(args[1])
+                except ValueError:
+                    print(f"  {YELLOW}Invalid port: {args[1]}{RESET}")
+                    return
+            dashboard.serve(port=port)
+        elif args[0] == "--sessions":
+            _show_sessions()
+        elif args[0] == "--continue":
+            if len(args) < 3:
+                print(f"  {YELLOW}Usage: jarvis-cli --continue <session_id> \"prompt\"{RESET}")
                 return
-        watch_directory(directory, interval)
-    elif args[0] == "--dashboard":
-        from jarvis_cli import dashboard
-        port = dashboard.DEFAULT_PORT
-        if len(args) > 1:
+            sid = args[1]
+            prompt = " ".join(args[2:])
+            api_key = _get_local_key()
+            if not api_key:
+                print(f"  {YELLOW}❌ Set ANTHROPIC_API_KEY or ~/.jarvis_cli/api_key{RESET}")
+                return
+            result = _run_local(prompt, api_key, sid)
+            if result:
+                print(f"\n  {DIM}session: {result.get('session_id', sid)}{RESET}")
+        else:
+            # One-shot
+            import urllib.request
+            prompt = " ".join(args)
+            payload = json.dumps({"prompt": prompt}).encode()
             try:
-                port = int(args[1])
-            except ValueError:
-                print(f"  {YELLOW}Invalid port: {args[1]}{RESET}")
-                return
-        dashboard.serve(port=port)
-    elif args[0] == "--sessions":
-        _show_sessions()
-    elif args[0] == "--continue":
-        if len(args) < 3:
-            print(f"  {YELLOW}Usage: jarvis-cli --continue <session_id> \"prompt\"{RESET}")
-            return
-        sid = args[1]
-        prompt = " ".join(args[2:])
-        api_key = _get_local_key()
-        if not api_key:
-            print(f"  {YELLOW}❌ Set ANTHROPIC_API_KEY or ~/.jarvis_cli/api_key{RESET}")
-            return
-        result = _run_local(prompt, api_key, sid)
-        if result:
-            print(f"\n  {DIM}session: {result.get('session_id', sid)}{RESET}")
-    else:
-        # One-shot
-        import urllib.request
-        prompt = " ".join(args)
-        payload = json.dumps({"prompt": prompt}).encode()
-        try:
-            req = urllib.request.Request(
-                f"{API_URL}/run", data=payload,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                result = json.loads(resp.read())
-            print(result.get("response", ""))
-        except Exception as e:
-            print(f"Error: {e}")
+                req = urllib.request.Request(
+                    f"{API_URL}/run", data=payload,
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    result = json.loads(resp.read())
+                print(result.get("response", ""))
+            except Exception as e:
+                print(f"Error: {e}")
+    except KeyboardInterrupt:
+        print(f"\n  {DIM}Interrupted{RESET}")
+        sys.exit(0)
+    except Exception as e:
+        print(f"  {YELLOW}❌ Error: {e}{RESET}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

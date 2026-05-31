@@ -104,12 +104,43 @@ fn read_input(history: &[String]) -> Option<String> {
     result
 }
 
+fn clear_paste_preview(lines_printed: usize) {
+    if lines_printed == 0 {
+        return;
+    }
+    // Move up and clear each line we printed
+    for _ in 0..lines_printed {
+        print!("\x1b[A\x1b[2K");
+    }
+    print!("\r");
+    io::stdout().flush().ok();
+}
+
+fn show_paste_preview(text: &str, buf: &str) -> usize {
+    let line_count = text.lines().count();
+    // First line: prompt with summary
+    print!("\x1b[2K\r  \x1b[32m❯\x1b[0m ");
+    if !buf.is_empty() {
+        print!("{buf} ");
+    }
+    print!("\x1b[2m({line_count} lines pasted)\x1b[0m\r\n");
+    let mut printed = 1; // the summary line after \r\n
+    for line in text.lines() {
+        print!("  \x1b[2m│\x1b[0m {line}\r\n");
+        printed += 1;
+    }
+    print!("  \x1b[2m[Enter] send · [Esc] cancel\x1b[0m");
+    io::stdout().flush().ok();
+    printed // doesn't count the status line (cursor stays on it)
+}
+
 fn read_input_raw(history: &[String]) -> Option<String> {
     let mut buf = String::new();
     let mut ctrl_c_count = 0u8;
     let mut paste_content: Option<String> = None;
-    let mut hist_idx: usize = history.len(); // points past end = current input
-    let mut saved_buf = String::new(); // saves current input when browsing history
+    let mut paste_lines_printed: usize = 0;
+    let mut hist_idx: usize = history.len();
+    let mut saved_buf = String::new();
 
     loop {
         if !event::poll(Duration::from_millis(500)).unwrap_or(false) {
@@ -119,15 +150,15 @@ fn read_input_raw(history: &[String]) -> Option<String> {
         match event::read() {
             Ok(Event::Paste(text)) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                let lines = text.lines().count();
-                print!("\x1b[2K\r  \x1b[32m❯\x1b[0m \x1b[2m{lines} lines ▸\x1b[0m");
-                print!("\r\n");
-                for line in text.lines() {
-                    print!("  \x1b[2m│\x1b[0m {line}\r\n");
+                // If it's a single line with no newline, just insert it into buf
+                if !text.contains('\n') {
+                    buf.push_str(&text);
+                    print!("\x1b[2K\r  \x1b[32m❯\x1b[0m {buf}");
+                    io::stdout().flush().ok();
+                } else {
+                    paste_lines_printed = show_paste_preview(&text, &buf);
+                    paste_content = Some(text);
                 }
-                print!("  \x1b[2mEnter to send, Esc to cancel\x1b[0m");
-                io::stdout().flush().ok();
-                paste_content = Some(text);
             }
             Ok(Event::Key(KeyEvent { code, modifiers, .. })) => {
                 match (code, modifiers) {
@@ -136,10 +167,15 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                         if ctrl_c_count >= 2 {
                             return None;
                         }
-                        print!("\r\n  \x1b[2m(Ctrl-C again to exit)\x1b[0m\r\n  \x1b[32m❯\x1b[0m ");
+                        if paste_content.is_some() {
+                            // Clear preview then show ctrl-c message
+                            clear_paste_preview(paste_lines_printed);
+                            paste_content = None;
+                            paste_lines_printed = 0;
+                        }
+                        print!("\x1b[2K\r\n  \x1b[2m(Ctrl-C again to exit)\x1b[0m\r\n  \x1b[32m❯\x1b[0m ");
                         io::stdout().flush().ok();
                         buf.clear();
-                        paste_content = None;
                     }
                     (KeyCode::Up, _) => {
                         if paste_content.is_none() && !history.is_empty() && hist_idx > 0 {
@@ -166,25 +202,13 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                             }
                         }
                     }
-                    (KeyCode::Tab, _) => {
-                        if let Some(ref text) = paste_content {
-                            print!("\x1b[2K\r  \x1b[32m❯\x1b[0m ");
-                            for (i, line) in text.lines().enumerate() {
-                                if i > 0 {
-                                    print!("\r\n  \x1b[2m│\x1b[0m {line}");
-                                } else {
-                                    print!("{line}");
-                                }
-                            }
-                            print!("\r\n  \x1b[2mEnter to send, Esc to cancel\x1b[0m");
-                            io::stdout().flush().ok();
-                        }
-                    }
                     (KeyCode::Esc, _) => {
                         if paste_content.is_some() {
-                            print!("\x1b[2K\r  \x1b[32m❯\x1b[0m ");
-                            io::stdout().flush().ok();
+                            clear_paste_preview(paste_lines_printed);
                             paste_content = None;
+                            paste_lines_printed = 0;
+                            print!("\x1b[2K\r  \x1b[32m❯\x1b[0m {buf}");
+                            io::stdout().flush().ok();
                         }
                     }
                     (KeyCode::Enter, _) => {
@@ -212,7 +236,6 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                     }
                     (KeyCode::Char(c), _) => {
                         if paste_content.is_none() {
-                            ctrl_c_count = 0;
                             buf.push(c);
                             print!("{c}");
                             io::stdout().flush().ok();
