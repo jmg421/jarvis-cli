@@ -492,7 +492,7 @@ def interactive():
 
   {DIM}cwd: {os.getcwd()}{RESET}
   {DIM}Multi-turn memory active. /new for fresh session.{RESET}
-  {DIM}Multiline: paste directly, use """ or empty line, or \\ continuation{RESET}
+  {DIM}Multiline: paste directly, use triple quotes or empty line, or \\ continuation{RESET}
 """)
 
     last_interrupt = [0.0]
