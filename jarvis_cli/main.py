@@ -492,6 +492,7 @@ def interactive():
 
   {DIM}cwd: {os.getcwd()}{RESET}
   {DIM}Multi-turn memory active. /new for fresh session.{RESET}
+  {DIM}Multiline: paste directly, use """ or empty line, or \\ continuation{RESET}
 """)
 
     last_interrupt = [0.0]
@@ -499,39 +500,70 @@ def interactive():
     def _read_multiline_input():
         """Read input with multi-line support.
         
-        Start with triple-quotes or triple-backticks for multi-line mode.
-        Use trailing backslash for line continuation.
+        Supports multiple input modes:
+        1. Automatic detection of pasted multiline content (contains newlines)
+        2. Explicit multi-line mode: start with triple quotes
+        3. Line continuation with trailing backslash
+        4. Empty line to continue multiline input
         """
-        first_line = input(f"  {GREEN}❯{RESET} ")
-        
-        # Explicit multi-line mode: start with """ or '''
-        if first_line.strip() in ('"""', "'''", '```'):
-            delimiter = first_line.strip()
-            print(f"  {DIM}(multi-line mode, end with {delimiter}){RESET}")
-            lines = []
-            while True:
-                try:
-                    line = input(f"  {DIM}…{RESET} ")
-                    if line.strip() == delimiter:
+        try:
+            first_line = input(f"  {GREEN}❯{RESET} ")
+            
+            # Check if the input already contains newlines (pasted content)
+            if '\n' in first_line:
+                print(f"  {DIM}(detected multiline paste: {len(first_line.splitlines())} lines){RESET}")
+                return first_line.strip()
+            
+            # Explicit multi-line mode: start with triple quotes
+            if first_line.strip() in ('"""', "'''", '```'):
+                delimiter = first_line.strip()
+                print(f"  {DIM}(multi-line mode, end with {delimiter}){RESET}")
+                lines = []
+                while True:
+                    try:
+                        line = input(f"  {DIM}…{RESET} ")
+                        if line.strip() == delimiter:
+                            break
+                        lines.append(line)
+                    except EOFError:
                         break
-                    lines.append(line)
+                result = '\n'.join(lines).strip()
+                if lines:
+                    print(f"  {DIM}({len(lines)} lines){RESET}")
+                return result
+            
+            # Check for empty line to start multiline input mode
+            if not first_line.strip():
+                print(f"  {DIM}(multiline mode - empty line to finish){RESET}")
+                lines = []
+                while True:
+                    try:
+                        line = input(f"  {DIM}…{RESET} ")
+                        if not line.strip():  # Empty line ends multiline input
+                            break
+                        lines.append(line)
+                    except EOFError:
+                        break
+                result = '\n'.join(lines).strip()
+                if lines:
+                    print(f"  {DIM}({len(lines)} lines){RESET}")
+                return result
+            
+            # Line continuation with trailing backslash
+            lines = [first_line]
+            while lines and lines[-1].endswith('\\'):
+                lines[-1] = lines[-1][:-1]  # strip the backslash
+                try:
+                    continuation = input(f"  {DIM}…{RESET} ")
+                    lines.append(continuation)
                 except EOFError:
                     break
-            result = '\n'.join(lines).strip()
-            if lines:
-                print(f"  {DIM}({len(lines)} lines){RESET}")
-            return result
-        
-        # Line continuation with trailing backslash
-        lines = [first_line]
-        while lines[-1].endswith('\\'):
-            lines[-1] = lines[-1][:-1]  # strip the backslash
-            try:
-                lines.append(input(f"  {DIM}…{RESET} "))
-            except EOFError:
-                break
-        
-        return '\n'.join(lines).strip()
+            
+            return '\n'.join(lines).strip()
+            
+        except Exception as e:
+            print(f"  {YELLOW}Input error: {e}{RESET}")
+            return ""
 
     while True:
         try:
