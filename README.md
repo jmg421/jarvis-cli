@@ -2,10 +2,27 @@
 
 Self-improving agentic development CLI powered by AI Synthesis.
 
-## Install
+## 🔒 Safe Installation
+
+**Protects your system packages with virtual environment isolation:**
 
 ```bash
-pip install -e .
+# One-time setup
+./cleanup_global.sh    # Remove any existing global installs  
+./setup_dev.sh         # Create safe virtual environment
+
+# Daily usage
+source venv/bin/activate
+jarvis-cli
+deactivate             # When done
+```
+
+See [DEVELOPMENT.md](./DEVELOPMENT.md) for complete safety guide.
+
+## ⚠️ Alternative (Less Safe)
+
+```bash
+pip install -e .       # Installs globally - may conflict with system packages
 ```
 
 ## Daemon Mode
