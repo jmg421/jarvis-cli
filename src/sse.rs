@@ -93,6 +93,11 @@ pub async fn stream(url: &str, prompt: &str, session_id: Option<&str>, api_key: 
                                     final_session_id = sid.clone();
                                 }
                             }
+                            "error" => {
+                                if let Some(text) = &event.text {
+                                    render::text_delta(&format!("\n\x1b[31m✗ Agent error: {text}\x1b[0m\n"));
+                                }
+                            }
                             _ => {}
                         }
                     }
