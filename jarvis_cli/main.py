@@ -171,6 +171,10 @@ def show_help():
     jarvis-cli --sessions      List recent conversation sessions
     jarvis-cli --continue <id> "prompt"  Continue an existing session
 
+  {GREEN}Shell Passthrough:{RESET}
+    {CYAN}!<command>{RESET}           Run any shell command inline (e.g. !pwd, !ls, !git status)
+    {CYAN}!cd <path>{RESET}           Change working directory (persists across prompts)
+
   {GREEN}Pattern Interrupts:{RESET}
     {CYAN}Ctrl-C once{RESET}         Cancel current operation (input/generation)
     {CYAN}Ctrl-C twice (2s){RESET}    Exit gracefully
@@ -697,6 +701,39 @@ def interactive():
             else:
                 session_id = parts[1].strip()
                 print(f"  {DIM}Resumed session: {session_id}{RESET}\n")
+            continue
+
+        # --- ! shell passthrough ---
+        # Any input starting with ! is executed directly as a shell command.
+        # Examples: !pwd  !ls -la  !git status  !cd ~/repos/nodes-bio
+        # Special: !cd <path> updates the process working directory.
+        if prompt.startswith("!"):
+            shell_cmd = prompt[1:].strip()
+            if not shell_cmd:
+                print(f"  {YELLOW}Usage: !<command>  e.g. !pwd, !ls, !git status{RESET}\n")
+                continue
+            # Handle cd specially — subprocess cwd changes don't persist
+            if shell_cmd.startswith("cd ") or shell_cmd == "cd":
+                target = shell_cmd[3:].strip() or str(Path.home())
+                target = str(Path(target).expanduser().resolve())
+                try:
+                    os.chdir(target)
+                    print(f"  {DIM}{target}{RESET}\n")
+                except Exception as e:
+                    print(f"  {YELLOW}cd: {e}{RESET}\n")
+                continue
+            try:
+                result_proc = subprocess.run(
+                    shell_cmd,
+                    shell=True,
+                    text=True,
+                    capture_output=False,   # stream directly to terminal
+                )
+                if result_proc.returncode != 0:
+                    print(f"  {DIM}[exit {result_proc.returncode}]{RESET}")
+            except Exception as e:
+                print(f"  {YELLOW}Error: {e}{RESET}")
+            print()
             continue
 
         print()
