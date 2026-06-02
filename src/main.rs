@@ -9,6 +9,11 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "jarvis", about = "Agentic development CLI — introspect • synthesize • build")]
 struct Cli {
+    /// Prompt to send non-interactively (like `--pipe` but as an arg).
+    /// Example: jarvis --prompt "list files in ~/repos"
+    #[arg(long, short = 'p')]
+    prompt: Option<String>,
+
     /// Continue an existing session by ID
     #[arg(long, short = 'c')]
     r#continue: Option<String>,
@@ -73,8 +78,72 @@ async fn main() {
         return;
     }
 
+    // --prompt / stdin pipe mode: read prompt, stream once, print, exit.
+    // Usage:
+    //   jarvis --prompt "task"
+    //   echo "task" | jarvis
+    //   cat spec.md | jarvis
+    let pipe_prompt = cli.prompt.or_else(|| {
+        // Only read stdin when it's not a TTY (i.e. data is being piped in)
+        if !is_stdin_tty() {
+            let mut buf = String::new();
+            use std::io::Read;
+            std::io::stdin().read_to_string(&mut buf).ok();
+            let trimmed = buf.trim().to_string();
+            if !trimmed.is_empty() { Some(trimmed) } else { None }
+        } else {
+            None
+        }
+    });
+
+    if let Some(prompt) = pipe_prompt {
+        // Ensure daemon is up
+        if !cli.no_daemon {
+            if let Err(e) = daemon::ensure_running(&cli.url).await {
+                eprintln!("  \x1b[33m⚠ {e}\x1b[0m");
+            }
+        }
+        let api_key = tui::load_api_key_pub();
+        match sse::stream(&cli.url, &prompt, cli.r#continue.as_deref(), api_key.as_deref()).await {
+            Ok((session_id, usage)) => {
+                if !usage.is_empty() {
+                    let cost = usage.estimated_cost_usd();
+                    let iters = if usage.iterations > 0 {
+                        format!("  {}↺", usage.iterations)
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "  \x1b[2msession: {session_id}  ·  {}↑ {}↓  ~${cost:.4}{iters}\x1b[0m",
+                        tui::fmt_tokens_pub(usage.input_tokens),
+                        tui::fmt_tokens_pub(usage.output_tokens),
+                    );
+                } else {
+                    eprintln!("  \x1b[2msession: {session_id}\x1b[0m");
+                }
+            }
+            Err(e) => {
+                eprintln!("  \x1b[31m✗ {e}\x1b[0m");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     tui::run(cli.url, cli.r#continue, cli.no_daemon).await;
     // Note: we intentionally do NOT stop the daemon here — it's a long-running
-    // service shared across sessions and other clients. Use `daemon::stop()`
-    // explicitly only when you want to tear down the agent.
+    // service shared across sessions and other clients.
+}
+
+/// Returns true if stdin is connected to a terminal (not a pipe/redirect).
+fn is_stdin_tty() -> bool {
+    #[cfg(unix)]
+    {
+        extern "C" { fn isatty(fd: i32) -> i32; }
+        unsafe { isatty(0) != 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }

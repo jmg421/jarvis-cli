@@ -16,12 +16,15 @@ jarvis                  # launches daemon + opens TUI
 ## Usage
 
 ```bash
-jarvis                          # Interactive TUI (auto-starts daemon)
-jarvis --continue <session_id>  # Resume a session
-jarvis --sessions               # List recent sessions
-jarvis --enqueue "task desc"    # Queue a background task
-jarvis --status                 # Show daemon + queue status
-jarvis --no-daemon              # Skip auto-start (daemon already running)
+jarvis                              # Interactive TUI (auto-starts daemon)
+jarvis --continue <session_id>      # Resume a session
+jarvis --sessions                   # List recent sessions
+jarvis --prompt "task"              # Non-interactive: send one prompt, print, exit
+echo "task" | jarvis                # Pipe stdin as a prompt (scripting mode)
+cat spec.md | jarvis                # Feed a file as the prompt
+jarvis --enqueue "task desc"        # Queue a background task
+jarvis --status                     # Show daemon + queue status
+jarvis --no-daemon                  # Skip auto-start (daemon already running)
 ```
 
 ## TUI Commands
@@ -32,6 +35,7 @@ jarvis --no-daemon              # Skip auto-start (daemon already running)
 | `/sessions` | List recent sessions |
 | `/resume <id>` | Resume session by ID |
 | `/session` | Show current session ID |
+| `/delete [id]` | Delete session (default: current) |
 | `/cost` | Show token usage & estimated cost |
 | `/clear` | Clear the terminal screen |
 | `/help` | Show command reference |
@@ -63,16 +67,36 @@ Multi-line paste is detected automatically — shows a preview with line count b
 After each response, a compact footer shows:
 
 ```
-session: abc123  ·  12.3k↑ 4.5k↓  ~$0.1087
+session: abc123  ·  12.3k↑ 4.5k↓  ~$0.1087  14↺
 ```
 
-Use `/cost` to see the cumulative total for the session.
+The `↺` count is the number of tool-use iterations the agent made. Use `/cost` to see the cumulative total for the session.
 
 Cost rates (Claude Sonnet 3.7):
 - Input: $3/M tokens
 - Output: $15/M tokens  
 - Cache read: $0.30/M tokens
 - Cache write: $3.75/M tokens
+
+## Pipe / Non-interactive Mode
+
+Any time stdin is not a TTY (piped data), or `--prompt` is passed, jarvis runs in single-shot mode:
+
+```bash
+# Ask a question and get the answer
+jarvis --prompt "what's the git log for ~/repos/jarvis-cli?"
+
+# Pipe a spec file and have the agent implement it
+cat SPEC.md | jarvis
+
+# Chain with other tools
+git diff HEAD~1 | jarvis --prompt "summarize this diff"
+
+# Use in scripts — exits with code 1 on error
+jarvis --prompt "run the test suite" && echo "done"
+```
+
+Session ID and token stats are printed to stderr, response text goes to stdout — composable.
 
 ## Daemon & Queue
 

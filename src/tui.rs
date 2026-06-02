@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use crate::{daemon, sse, sse::Usage};
 
+pub fn load_api_key_pub() -> Option<String> { load_api_key() }
+
 fn load_api_key() -> Option<String> {
     let key_file = dirs::home_dir()?.join(".jarvis_cli").join("api_key");
     fs::read_to_string(key_file).ok().map(|s| s.trim().to_string())
@@ -41,18 +43,19 @@ fn save_history(history: &[String]) {
 fn print_help() {
     println!("\n  \x1b[1;36mJarvis CLI — Commands\x1b[0m");
     println!("  \x1b[2m─────────────────────────────────────────────\x1b[0m");
-    println!("  \x1b[33m/new\x1b[0m              Start a fresh session");
-    println!("  \x1b[33m/sessions\x1b[0m         List recent sessions");
-    println!("  \x1b[33m/resume <id>\x1b[0m      Resume a session by ID");
-    println!("  \x1b[33m/session\x1b[0m          Show current session ID");
-    println!("  \x1b[33m/cost\x1b[0m             Show token usage & estimated cost");
-    println!("  \x1b[33m/clear\x1b[0m            Clear the terminal screen");
-    println!("  \x1b[33m/help\x1b[0m             Show this help");
-    println!("  \x1b[33m/quit\x1b[0m  \x1b[2mor Ctrl-C×2\x1b[0m  Exit");
+    println!("  \x1b[33m/new\x1b[0m                   Start a fresh session");
+    println!("  \x1b[33m/sessions\x1b[0m              List recent sessions");
+    println!("  \x1b[33m/resume <id>\x1b[0m           Resume a session by ID");
+    println!("  \x1b[33m/session\x1b[0m               Show current session ID");
+    println!("  \x1b[33m/delete [id]\x1b[0m           Delete session (default: current)");
+    println!("  \x1b[33m/cost\x1b[0m                  Show token usage & estimated cost");
+    println!("  \x1b[33m/clear\x1b[0m                 Clear the terminal screen");
+    println!("  \x1b[33m/help\x1b[0m                  Show this help");
+    println!("  \x1b[33m/quit\x1b[0m  \x1b[2mor Ctrl-C×2\x1b[0m     Exit");
     println!("  \x1b[2m─────────────────────────────────────────────\x1b[0m");
     println!("  \x1b[2mPaste: multi-line content shows preview → Enter to send, Esc to cancel\x1b[0m");
     println!("  \x1b[2mHistory: ↑/↓ arrows to navigate\x1b[0m");
-    println!("  \x1b[2mLine editing: Ctrl-A/E (start/end) Ctrl-W (del word) Ctrl-U (clear)\x1b[0m\n");
+    println!("  \x1b[2mLine editing: Ctrl-A/E (start/end) Ctrl-W (del word) Ctrl-U/K (clear)\x1b[0m\n");
 }
 
 pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
@@ -148,6 +151,32 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
             _ => {}
         }
 
+        // Handle /delete <id> with explicit session id
+        if let Some(id) = prompt.strip_prefix("/delete") {
+            let id = id.trim().to_string();
+            let target = if id.is_empty() {
+                session_id.clone()
+            } else {
+                Some(id)
+            };
+            match target {
+                Some(sid) => {
+                    match sse::delete_session(&url, &sid).await {
+                        Ok(()) => {
+                            println!("  \x1b[32m✓ Deleted session {sid}\x1b[0m\n");
+                            if session_id.as_deref() == Some(sid.as_str()) {
+                                session_id = None;
+                                cumulative_usage = Usage::default();
+                            }
+                        }
+                        Err(e) => println!("  \x1b[31m✗ {e}\x1b[0m\n"),
+                    }
+                }
+                None => println!("  \x1b[33mUsage: /delete [session_id]\x1b[0m\n"),
+            }
+            continue;
+        }
+
         // Handle /resume <id> — might have a space
         if let Some(id) = prompt.strip_prefix("/resume") {
             let id = id.trim();
@@ -174,8 +203,13 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
 
                 if !usage.is_empty() {
                     let cost = usage.estimated_cost_usd();
+                    let iters = if usage.iterations > 0 {
+                        format!("  {}↺", usage.iterations)
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "  \x1b[2msession: {new_session_id}  ·  {}↑ {}↓  ~${cost:.4}\x1b[0m\n",
+                        "  \x1b[2msession: {new_session_id}  ·  {}↑ {}↓  ~${cost:.4}{iters}\x1b[0m\n",
                         fmt_tokens(usage.input_tokens),
                         fmt_tokens(usage.output_tokens),
                     );
@@ -192,6 +226,8 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
 
     println!("\n  \x1b[2mGoodbye.\x1b[0m\n");
 }
+
+pub fn fmt_tokens_pub(n: u64) -> String { fmt_tokens(n) }
 
 fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {

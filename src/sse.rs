@@ -13,6 +13,7 @@ pub struct Usage {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub iterations: u64,
 }
 
 impl Usage {
@@ -62,6 +63,9 @@ struct SseEvent {
     // context_management
     #[serde(default)]
     chars_removed: Option<u64>,
+    // done
+    #[serde(default)]
+    iterations: Option<u64>,
 }
 
 /// Stream a prompt to the backend, printing events as they arrive.
@@ -85,9 +89,9 @@ pub async fn stream(
         return Err(format!("Backend returned {}", resp.status()));
     }
 
-    // Show thinking indicator while we wait for the first event
-    render::thinking();
-    let mut got_first_event = false;
+    // Show animated spinner while we wait for the first event.
+    // Dropping the handle stops and clears the spinner.
+    let mut spinner: Option<render::SpinnerHandle> = Some(render::thinking());
 
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
@@ -95,12 +99,13 @@ pub async fn stream(
     let mut final_usage = Usage::default();
 
     loop {
-        let chunk = match timeout(Duration::from_secs(120), stream.next()).await {
+        let chunk = match timeout(Duration::from_secs(180), stream.next()).await {
             Ok(Some(c)) => c,
             Ok(None) => break,
             Err(_) => {
+                drop(spinner.take());
                 render::finish();
-                return Err("Stream timeout: no data for 120s".to_string());
+                return Err("Stream timeout: no data for 180s".to_string());
             }
         };
         let chunk = chunk.map_err(|e| format!("Stream error: {e}"))?;
@@ -114,15 +119,13 @@ pub async fn stream(
             for line in message.lines() {
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
+                        drop(spinner.take());
                         render::finish();
                         return Ok((final_session_id, final_usage));
                     }
                     if let Ok(event) = serde_json::from_str::<SseEvent>(data) {
-                        // Clear thinking indicator on first real event
-                        if !got_first_event {
-                            render::clear_thinking();
-                            got_first_event = true;
-                        }
+                        // Drop spinner on first real event (clears the line)
+                        drop(spinner.take());
 
                         match event.event_type.as_str() {
                             "text_delta" => {
@@ -149,20 +152,22 @@ pub async fn stream(
                                 render::context_management(chars);
                             }
                             "done" => {
+                                drop(spinner.take());
                                 if let Some(sid) = &event.session_id {
                                     final_session_id = sid.clone();
+                                }
+                                if let Some(iters) = event.iterations {
+                                    final_usage.iterations = iters;
                                 }
                                 if let Some(usage_val) = &event.usage {
                                     if let Some(obj) = usage_val.as_object() {
                                         let get_u64 = |k: &str| {
                                             obj.get(k).and_then(|v| v.as_u64()).unwrap_or(0)
                                         };
-                                        final_usage = Usage {
-                                            input_tokens: get_u64("input_tokens"),
-                                            output_tokens: get_u64("output_tokens"),
-                                            cache_read_tokens: get_u64("cache_read_input_tokens"),
-                                            cache_write_tokens: get_u64("cache_creation_input_tokens"),
-                                        };
+                                        final_usage.input_tokens = get_u64("input_tokens");
+                                        final_usage.output_tokens = get_u64("output_tokens");
+                                        final_usage.cache_read_tokens = get_u64("cache_read_input_tokens");
+                                        final_usage.cache_write_tokens = get_u64("cache_creation_input_tokens");
                                     }
                                 }
                             }
@@ -240,6 +245,22 @@ pub async fn list_sessions(url: &str) -> Result<Vec<String>, String> {
     };
 
     Ok(lines)
+}
+
+/// Delete a session from the backend.
+pub async fn delete_session(url: &str, session_id: &str) -> Result<(), String> {
+    let client = Client::new();
+    let resp = client
+        .delete(format!("{url}/sessions/{session_id}"))
+        .send()
+        .await
+        .map_err(|e| format!("Connection failed: {e}"))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("Backend returned {}", resp.status()))
+    }
 }
 
 /// Minimal Unix timestamp → "MM/DD HH:MM" formatter (no external time crate).
