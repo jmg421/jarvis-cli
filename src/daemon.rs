@@ -51,18 +51,27 @@ pub async fn ensure_running(url: &str) -> Result<(), String> {
     let pid_path = pid_file();
     fs::create_dir_all(pid_path.parent().unwrap()).ok();
 
-    // Kill stale process if pid file exists
+    // Kill stale process: check pid file first, then check port
     if let Ok(pid_str) = fs::read_to_string(&pid_path) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            // Check if process is alive
-            let alive = Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !alive {
-                fs::remove_file(&pid_path).ok();
-            }
+            Command::new("kill").arg(pid.to_string()).status().ok();
+            std::thread::sleep(Duration::from_millis(300));
+            Command::new("kill").args(["-9", &pid.to_string()]).status().ok();
+            fs::remove_file(&pid_path).ok();
+        }
+    }
+
+    // Kill anything else holding the port (stale process without pid file)
+    if let Ok(output) = Command::new("lsof")
+        .args(["-ti", &format!(":{port}")])
+        .output()
+    {
+        let pids = String::from_utf8_lossy(&output.stdout);
+        for pid in pids.split_whitespace() {
+            Command::new("kill").args(["-9", pid]).status().ok();
+        }
+        if !pids.is_empty() {
+            std::thread::sleep(Duration::from_millis(500));
         }
     }
 
@@ -97,6 +106,8 @@ pub async fn ensure_running(url: &str) -> Result<(), String> {
 }
 
 /// Stop the daemon if we started it.
+/// Not called automatically on exit — the agent is a long-running shared service.
+#[allow(dead_code)]
 pub fn stop() {
     let pid_path = pid_file();
     if let Ok(pid_str) = fs::read_to_string(&pid_path) {

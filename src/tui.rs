@@ -38,6 +38,20 @@ fn save_history(history: &[String]) {
     fs::write(path, history[start..].join("\n")).ok();
 }
 
+fn print_help() {
+    println!("\n  \x1b[1;36mJarvis CLI — Commands\x1b[0m");
+    println!("  \x1b[2m─────────────────────────────────────────────\x1b[0m");
+    println!("  \x1b[33m/new\x1b[0m              Start a fresh session");
+    println!("  \x1b[33m/sessions\x1b[0m         List recent sessions");
+    println!("  \x1b[33m/resume <id>\x1b[0m      Resume a session by ID");
+    println!("  \x1b[33m/session\x1b[0m          Show current session ID");
+    println!("  \x1b[33m/help\x1b[0m             Show this help");
+    println!("  \x1b[33m/quit\x1b[0m  \x1b[2mor Ctrl-C×2\x1b[0m  Exit");
+    println!("  \x1b[2m─────────────────────────────────────────────\x1b[0m");
+    println!("  \x1b[2mPaste: multi-line content shows preview → Enter to send, Esc to cancel\x1b[0m");
+    println!("  \x1b[2mHistory: ↑/↓ arrows to navigate\x1b[0m\n");
+}
+
 pub async fn run(url: String, session_id: Option<String>) {
     let mut session_id = session_id;
 
@@ -51,11 +65,14 @@ pub async fn run(url: String, session_id: Option<String>) {
     let mut history = load_history();
 
     println!("\n  \x1b[36m╭──────────────────────────────────────────────────╮\x1b[0m");
-    println!("  \x1b[36m│\x1b[0m Jarvis CLI — Rust TUI                            \x1b[36m│\x1b[0m");
-    println!("  \x1b[36m│\x1b[0m introspect • synthesize • build                   \x1b[36m│\x1b[0m");
+    println!("  \x1b[36m│\x1b[0m \x1b[1mJarvis CLI\x1b[0m — Rust TUI                          \x1b[36m│\x1b[0m");
+    println!("  \x1b[36m│\x1b[0m \x1b[2mintrospect • synthesize • build\x1b[0m                  \x1b[36m│\x1b[0m");
     println!("  \x1b[36m╰──────────────────────────────────────────────────╯\x1b[0m");
     println!("  \x1b[2mBackend: {url}\x1b[0m");
-    println!("  \x1b[2mCtrl-C twice to exit. Paste detected automatically.\x1b[0m\n");
+    if let Some(ref sid) = session_id {
+        println!("  \x1b[2mResuming session: {sid}\x1b[0m");
+    }
+    println!("  \x1b[2mType /help for commands. Ctrl-C twice to exit.\x1b[0m\n");
 
     loop {
         let prompt = match read_input(&history) {
@@ -64,21 +81,67 @@ pub async fn run(url: String, session_id: Option<String>) {
             None => break,
         };
 
-        if prompt == "/quit" || prompt == "/exit" || prompt == "/q" {
-            break;
+        match prompt.as_str() {
+            "/quit" | "/exit" | "/q" => break,
+
+            "/new" => {
+                session_id = None;
+                println!("  \x1b[2mNew session started.\x1b[0m\n");
+                continue;
+            }
+
+            "/sessions" => {
+                match sse::list_sessions(&url).await {
+                    Ok(sessions) if sessions.is_empty() => {
+                        println!("  \x1b[2mNo sessions found.\x1b[0m\n");
+                    }
+                    Ok(sessions) => {
+                        println!("\n  \x1b[1;32mRecent sessions:\x1b[0m");
+                        for s in &sessions {
+                            println!("  {s}");
+                        }
+                        println!();
+                    }
+                    Err(e) => println!("  \x1b[31m✗ {e}\x1b[0m\n"),
+                }
+                continue;
+            }
+
+            "/session" => {
+                match &session_id {
+                    Some(sid) => println!("  \x1b[2mCurrent session: \x1b[36m{sid}\x1b[0m\n"),
+                    None => println!("  \x1b[2mNo active session (next message starts one).\x1b[0m\n"),
+                }
+                continue;
+            }
+
+            "/help" => {
+                print_help();
+                continue;
+            }
+
+            _ => {}
         }
-        if prompt == "/new" {
-            session_id = None;
-            println!("  \x1b[2mNew session.\x1b[0m\n");
+
+        // Handle /resume <id> — might have a space
+        if let Some(id) = prompt.strip_prefix("/resume") {
+            let id = id.trim();
+            if id.is_empty() {
+                println!("  \x1b[33mUsage: /resume <session_id>\x1b[0m\n");
+            } else {
+                session_id = Some(id.to_string());
+                println!("  \x1b[2mResumed session: \x1b[36m{id}\x1b[0m\n");
+            }
             continue;
         }
 
-        // Add to history
+        // Add to history (skip slash-commands, already handled above)
         history.push(prompt.clone());
         save_history(&history);
 
         match sse::stream(&url, &prompt, session_id.as_deref(), api_key.as_deref()).await {
             Ok(new_session_id) => {
+                println!("  \x1b[2msession: {new_session_id}\x1b[0m\n");
                 session_id = Some(new_session_id);
             }
             Err(e) => {
@@ -108,7 +171,6 @@ fn clear_paste_preview(lines_printed: usize) {
     if lines_printed == 0 {
         return;
     }
-    // Move up and clear each line we printed
     for _ in 0..lines_printed {
         print!("\x1b[A\x1b[2K");
     }
@@ -118,20 +180,19 @@ fn clear_paste_preview(lines_printed: usize) {
 
 fn show_paste_preview(text: &str, buf: &str) -> usize {
     let line_count = text.lines().count();
-    // First line: prompt with summary
     print!("\x1b[2K\r  \x1b[32m❯\x1b[0m ");
     if !buf.is_empty() {
         print!("{buf} ");
     }
     print!("\x1b[2m({line_count} lines pasted)\x1b[0m\r\n");
-    let mut printed = 1; // the summary line after \r\n
+    let mut printed = 1;
     for line in text.lines() {
         print!("  \x1b[2m│\x1b[0m {line}\r\n");
         printed += 1;
     }
     print!("  \x1b[2m[Enter] send · [Esc] cancel\x1b[0m");
     io::stdout().flush().ok();
-    printed // doesn't count the status line (cursor stays on it)
+    printed
 }
 
 fn read_input_raw(history: &[String]) -> Option<String> {
@@ -150,7 +211,7 @@ fn read_input_raw(history: &[String]) -> Option<String> {
         match event::read() {
             Ok(Event::Paste(text)) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                // If it's a single line with no newline, just insert it into buf
+                // Single-line paste: just insert into buffer
                 if !text.contains('\n') {
                     buf.push_str(&text);
                     print!("\x1b[2K\r  \x1b[32m❯\x1b[0m {buf}");
@@ -168,7 +229,6 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                             return None;
                         }
                         if paste_content.is_some() {
-                            // Clear preview then show ctrl-c message
                             clear_paste_preview(paste_lines_printed);
                             paste_content = None;
                             paste_lines_printed = 0;
@@ -189,17 +249,15 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                         }
                     }
                     (KeyCode::Down, _) => {
-                        if paste_content.is_none() {
-                            if hist_idx < history.len() {
-                                hist_idx += 1;
-                                buf = if hist_idx == history.len() {
-                                    saved_buf.clone()
-                                } else {
-                                    history[hist_idx].clone()
-                                };
-                                print!("\x1b[2K\r  \x1b[32m❯\x1b[0m {buf}");
-                                io::stdout().flush().ok();
-                            }
+                        if paste_content.is_none() && hist_idx < history.len() {
+                            hist_idx += 1;
+                            buf = if hist_idx == history.len() {
+                                saved_buf.clone()
+                            } else {
+                                history[hist_idx].clone()
+                            };
+                            print!("\x1b[2K\r  \x1b[32m❯\x1b[0m {buf}");
+                            io::stdout().flush().ok();
                         }
                     }
                     (KeyCode::Esc, _) => {
