@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::{daemon, sse};
+use crate::{daemon, sse, sse::Usage};
 
 fn load_api_key() -> Option<String> {
     let key_file = dirs::home_dir()?.join(".jarvis_cli").join("api_key");
@@ -45,24 +45,34 @@ fn print_help() {
     println!("  \x1b[33m/sessions\x1b[0m         List recent sessions");
     println!("  \x1b[33m/resume <id>\x1b[0m      Resume a session by ID");
     println!("  \x1b[33m/session\x1b[0m          Show current session ID");
+    println!("  \x1b[33m/cost\x1b[0m             Show token usage & estimated cost");
+    println!("  \x1b[33m/clear\x1b[0m            Clear the terminal screen");
     println!("  \x1b[33m/help\x1b[0m             Show this help");
     println!("  \x1b[33m/quit\x1b[0m  \x1b[2mor Ctrl-C×2\x1b[0m  Exit");
     println!("  \x1b[2m─────────────────────────────────────────────\x1b[0m");
     println!("  \x1b[2mPaste: multi-line content shows preview → Enter to send, Esc to cancel\x1b[0m");
-    println!("  \x1b[2mHistory: ↑/↓ arrows to navigate\x1b[0m\n");
+    println!("  \x1b[2mHistory: ↑/↓ arrows to navigate\x1b[0m");
+    println!("  \x1b[2mLine editing: Ctrl-A/E (start/end) Ctrl-W (del word) Ctrl-U (clear)\x1b[0m\n");
 }
 
-pub async fn run(url: String, session_id: Option<String>) {
+pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
     let mut session_id = session_id;
 
     // Ensure agent backend is running
-    if let Err(e) = daemon::ensure_running(&url).await {
+    if no_daemon {
+        // skip auto-start; just check
+        if !daemon::is_running(&url).await {
+            println!("  \x1b[33m⚠ Agent not running at {url}\x1b[0m");
+            println!("  \x1b[2mStart: cd ~/repos/jarvis-agent && uvicorn jarvis_agent.server:app --port 8100\x1b[0m\n");
+        }
+    } else if let Err(e) = daemon::ensure_running(&url).await {
         println!("  \x1b[31m✗ {e}\x1b[0m");
         println!("  \x1b[2mStart manually: cd ~/repos/jarvis-agent && uvicorn jarvis_agent.server:app --port 8100\x1b[0m\n");
     }
 
     let api_key = load_api_key();
     let mut history = load_history();
+    let mut cumulative_usage = Usage::default();
 
     println!("\n  \x1b[36m╭──────────────────────────────────────────────────╮\x1b[0m");
     println!("  \x1b[36m│\x1b[0m \x1b[1mJarvis CLI\x1b[0m — Rust TUI                          \x1b[36m│\x1b[0m");
@@ -115,6 +125,21 @@ pub async fn run(url: String, session_id: Option<String>) {
                 continue;
             }
 
+            "/cost" => {
+                print_cost(&cumulative_usage);
+                continue;
+            }
+
+            "/clear" => {
+                // ANSI clear screen + move cursor to top
+                print!("\x1b[2J\x1b[H");
+                io::stdout().flush().ok();
+                if let Some(ref sid) = session_id {
+                    println!("  \x1b[2mSession: \x1b[36m{sid}\x1b[0m\n");
+                }
+                continue;
+            }
+
             "/help" => {
                 print_help();
                 continue;
@@ -140,8 +165,23 @@ pub async fn run(url: String, session_id: Option<String>) {
         save_history(&history);
 
         match sse::stream(&url, &prompt, session_id.as_deref(), api_key.as_deref()).await {
-            Ok(new_session_id) => {
-                println!("  \x1b[2msession: {new_session_id}\x1b[0m\n");
+            Ok((new_session_id, usage)) => {
+                // Accumulate usage across all turns
+                cumulative_usage.input_tokens += usage.input_tokens;
+                cumulative_usage.output_tokens += usage.output_tokens;
+                cumulative_usage.cache_read_tokens += usage.cache_read_tokens;
+                cumulative_usage.cache_write_tokens += usage.cache_write_tokens;
+
+                if !usage.is_empty() {
+                    let cost = usage.estimated_cost_usd();
+                    println!(
+                        "  \x1b[2msession: {new_session_id}  ·  {}↑ {}↓  ~${cost:.4}\x1b[0m\n",
+                        fmt_tokens(usage.input_tokens),
+                        fmt_tokens(usage.output_tokens),
+                    );
+                } else {
+                    println!("  \x1b[2msession: {new_session_id}\x1b[0m\n");
+                }
                 session_id = Some(new_session_id);
             }
             Err(e) => {
@@ -151,6 +191,36 @@ pub async fn run(url: String, session_id: Option<String>) {
     }
 
     println!("\n  \x1b[2mGoodbye.\x1b[0m\n");
+}
+
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn print_cost(usage: &Usage) {
+    if usage.is_empty() {
+        println!("  \x1b[2mNo token usage recorded yet.\x1b[0m\n");
+        return;
+    }
+    let total_cost = usage.estimated_cost_usd();
+    println!("\n  \x1b[1;36mToken Usage (session total)\x1b[0m");
+    println!("  \x1b[2m─────────────────────────────────────\x1b[0m");
+    println!("  Input tokens:         \x1b[33m{}\x1b[0m", fmt_tokens(usage.input_tokens));
+    println!("  Output tokens:        \x1b[33m{}\x1b[0m", fmt_tokens(usage.output_tokens));
+    if usage.cache_read_tokens > 0 {
+        println!("  Cache read tokens:    \x1b[2m{}\x1b[0m", fmt_tokens(usage.cache_read_tokens));
+    }
+    if usage.cache_write_tokens > 0 {
+        println!("  Cache write tokens:   \x1b[2m{}\x1b[0m", fmt_tokens(usage.cache_write_tokens));
+    }
+    println!("  \x1b[2m─────────────────────────────────────\x1b[0m");
+    println!("  Estimated cost:       \x1b[32m~${total_cost:.4}\x1b[0m  \x1b[2m(Claude Sonnet 3.7 rates)\x1b[0m\n");
 }
 
 fn read_input(history: &[String]) -> Option<String> {
@@ -195,13 +265,41 @@ fn show_paste_preview(text: &str, buf: &str) -> usize {
     printed
 }
 
+/// Redraw the input line from scratch given buffer content and cursor position (char index).
+/// The prompt is "  ❯ " (4 display columns).
+fn redraw_line(buf: &str, cursor: usize) {
+    // cursor is a char index; convert to byte index for slicing
+    let cursor_byte = buf
+        .char_indices()
+        .nth(cursor)
+        .map(|(i, _)| i)
+        .unwrap_or(buf.len());
+    let before = &buf[..cursor_byte];
+
+    // Clear line, reprint prompt + full buffer, then move cursor back
+    print!("\x1b[2K\r  \x1b[32m❯\x1b[0m {buf}");
+
+    // How many chars are after the cursor? Move left by that many.
+    let after_chars = buf[cursor_byte..].chars().count();
+    if after_chars > 0 {
+        print!("\x1b[{after_chars}D");
+    }
+    let _ = before; // suppress warning
+    io::stdout().flush().ok();
+}
+
 fn read_input_raw(history: &[String]) -> Option<String> {
     let mut buf = String::new();
+    // cursor is a char-index (not byte-index) into buf
+    let mut cursor: usize = 0;
     let mut ctrl_c_count = 0u8;
     let mut paste_content: Option<String> = None;
     let mut paste_lines_printed: usize = 0;
     let mut hist_idx: usize = history.len();
     let mut saved_buf = String::new();
+
+    // Helper: char count of buf
+    let char_count = |s: &str| s.chars().count();
 
     loop {
         if !event::poll(Duration::from_millis(500)).unwrap_or(false) {
@@ -211,11 +309,12 @@ fn read_input_raw(history: &[String]) -> Option<String> {
         match event::read() {
             Ok(Event::Paste(text)) => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                // Single-line paste: just insert into buffer
                 if !text.contains('\n') {
-                    buf.push_str(&text);
-                    print!("\x1b[2K\r  \x1b[32m❯\x1b[0m {buf}");
-                    io::stdout().flush().ok();
+                    // Insert pasted text at cursor
+                    let byte_pos = buf.char_indices().nth(cursor).map(|(i, _)| i).unwrap_or(buf.len());
+                    buf.insert_str(byte_pos, &text);
+                    cursor += char_count(&text);
+                    redraw_line(&buf, cursor);
                 } else {
                     paste_lines_printed = show_paste_preview(&text, &buf);
                     paste_content = Some(text);
@@ -223,6 +322,7 @@ fn read_input_raw(history: &[String]) -> Option<String> {
             }
             Ok(Event::Key(KeyEvent { code, modifiers, .. })) => {
                 match (code, modifiers) {
+                    // ── Exit / cancel ────────────────────────────────────
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                         ctrl_c_count += 1;
                         if ctrl_c_count >= 2 {
@@ -233,10 +333,108 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                             paste_content = None;
                             paste_lines_printed = 0;
                         }
+                        buf.clear();
+                        cursor = 0;
                         print!("\x1b[2K\r\n  \x1b[2m(Ctrl-C again to exit)\x1b[0m\r\n  \x1b[32m❯\x1b[0m ");
                         io::stdout().flush().ok();
-                        buf.clear();
                     }
+
+                    // ── Readline: move to start of line ──────────────────
+                    (KeyCode::Char('a'), KeyModifiers::CONTROL)
+                    | (KeyCode::Home, _) => {
+                        if paste_content.is_none() {
+                            cursor = 0;
+                            redraw_line(&buf, cursor);
+                        }
+                    }
+
+                    // ── Readline: move to end of line ────────────────────
+                    (KeyCode::Char('e'), KeyModifiers::CONTROL)
+                    | (KeyCode::End, _) => {
+                        if paste_content.is_none() {
+                            cursor = char_count(&buf);
+                            redraw_line(&buf, cursor);
+                        }
+                    }
+
+                    // ── Readline: delete from cursor to start ─────────────
+                    (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                        if paste_content.is_none() {
+                            let byte_pos = buf.char_indices().nth(cursor).map(|(i,_)| i).unwrap_or(buf.len());
+                            buf.drain(..byte_pos);
+                            cursor = 0;
+                            redraw_line(&buf, cursor);
+                        }
+                    }
+
+                    // ── Readline: delete word before cursor ───────────────
+                    (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+                        if paste_content.is_none() && cursor > 0 {
+                            let byte_pos = buf.char_indices().nth(cursor).map(|(i,_)| i).unwrap_or(buf.len());
+                            // Find start of previous word (skip spaces, then word chars)
+                            let chars_before: Vec<char> = buf[..byte_pos].chars().collect();
+                            let mut i = chars_before.len();
+                            while i > 0 && chars_before[i - 1] == ' ' { i -= 1; }
+                            while i > 0 && chars_before[i - 1] != ' ' { i -= 1; }
+                            // i is now char index of word start
+                            let new_byte_pos = buf.char_indices().nth(i).map(|(b,_)| b).unwrap_or(0);
+                            buf.drain(new_byte_pos..byte_pos);
+                            cursor = i;
+                            redraw_line(&buf, cursor);
+                        }
+                    }
+
+                    // ── Readline: delete from cursor to end ───────────────
+                    (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                        if paste_content.is_none() {
+                            let byte_pos = buf.char_indices().nth(cursor).map(|(i,_)| i).unwrap_or(buf.len());
+                            buf.truncate(byte_pos);
+                            redraw_line(&buf, cursor);
+                        }
+                    }
+
+                    // ── Left arrow: move cursor left ──────────────────────
+                    (KeyCode::Left, KeyModifiers::NONE) => {
+                        if paste_content.is_none() && cursor > 0 {
+                            cursor -= 1;
+                            redraw_line(&buf, cursor);
+                        }
+                    }
+
+                    // ── Ctrl-Left / Alt-Left: jump word left ─────────────
+                    (KeyCode::Left, m) if m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                        if paste_content.is_none() && cursor > 0 {
+                            let chars: Vec<char> = buf.chars().collect();
+                            let mut i = cursor;
+                            while i > 0 && chars[i - 1] == ' ' { i -= 1; }
+                            while i > 0 && chars[i - 1] != ' ' { i -= 1; }
+                            cursor = i;
+                            redraw_line(&buf, cursor);
+                        }
+                    }
+
+                    // ── Right arrow: move cursor right ────────────────────
+                    (KeyCode::Right, KeyModifiers::NONE) => {
+                        if paste_content.is_none() && cursor < char_count(&buf) {
+                            cursor += 1;
+                            redraw_line(&buf, cursor);
+                        }
+                    }
+
+                    // ── Ctrl-Right / Alt-Right: jump word right ──────────
+                    (KeyCode::Right, m) if m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                        if paste_content.is_none() {
+                            let chars: Vec<char> = buf.chars().collect();
+                            let len = chars.len();
+                            let mut i = cursor;
+                            while i < len && chars[i] != ' ' { i += 1; }
+                            while i < len && chars[i] == ' '  { i += 1; }
+                            cursor = i;
+                            redraw_line(&buf, cursor);
+                        }
+                    }
+
+                    // ── Up arrow: history prev ────────────────────────────
                     (KeyCode::Up, _) => {
                         if paste_content.is_none() && !history.is_empty() && hist_idx > 0 {
                             if hist_idx == history.len() {
@@ -244,10 +442,12 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                             }
                             hist_idx -= 1;
                             buf = history[hist_idx].clone();
-                            print!("\x1b[2K\r  \x1b[32m❯\x1b[0m {buf}");
-                            io::stdout().flush().ok();
+                            cursor = char_count(&buf);
+                            redraw_line(&buf, cursor);
                         }
                     }
+
+                    // ── Down arrow: history next ──────────────────────────
                     (KeyCode::Down, _) => {
                         if paste_content.is_none() && hist_idx < history.len() {
                             hist_idx += 1;
@@ -256,50 +456,71 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                             } else {
                                 history[hist_idx].clone()
                             };
-                            print!("\x1b[2K\r  \x1b[32m❯\x1b[0m {buf}");
-                            io::stdout().flush().ok();
+                            cursor = char_count(&buf);
+                            redraw_line(&buf, cursor);
                         }
                     }
+
+                    // ── Escape: cancel paste preview ──────────────────────
                     (KeyCode::Esc, _) => {
                         if paste_content.is_some() {
                             clear_paste_preview(paste_lines_printed);
                             paste_content = None;
                             paste_lines_printed = 0;
-                            print!("\x1b[2K\r  \x1b[32m❯\x1b[0m {buf}");
-                            io::stdout().flush().ok();
+                            redraw_line(&buf, cursor);
                         }
                     }
+
+                    // ── Enter: submit ─────────────────────────────────────
                     (KeyCode::Enter, _) => {
                         if let Some(text) = paste_content {
-                            if buf.is_empty() {
-                                return Some(text);
+                            let combined = if buf.is_empty() {
+                                text
                             } else {
-                                buf.push('\n');
-                                buf.push_str(&text);
-                                return Some(buf);
-                            }
+                                format!("{buf}\n{text}")
+                            };
+                            return Some(combined);
                         }
                         if !buf.is_empty() {
                             return Some(buf);
                         }
                     }
+
+                    // ── Backspace: delete char before cursor ──────────────
                     (KeyCode::Backspace, _) => {
-                        if paste_content.is_none() {
-                            if buf.pop().is_some() {
-                                print!("\x08 \x08");
-                                io::stdout().flush().ok();
-                            }
+                        if paste_content.is_none() && cursor > 0 {
+                            let byte_pos = buf.char_indices().nth(cursor).map(|(i,_)| i).unwrap_or(buf.len());
+                            // Remove the char before cursor
+                            let prev_byte = buf.char_indices().nth(cursor - 1).map(|(i,_)| i).unwrap_or(0);
+                            buf.drain(prev_byte..byte_pos);
+                            cursor -= 1;
+                            redraw_line(&buf, cursor);
                         }
                         ctrl_c_count = 0;
                     }
+
+                    // ── Delete: delete char at cursor ─────────────────────
+                    (KeyCode::Delete, _) => {
+                        if paste_content.is_none() && cursor < char_count(&buf) {
+                            let byte_pos = buf.char_indices().nth(cursor).map(|(i,_)| i).unwrap_or(buf.len());
+                            let next_byte = buf[byte_pos..].char_indices().nth(1).map(|(i,_)| byte_pos + i).unwrap_or(buf.len());
+                            buf.drain(byte_pos..next_byte);
+                            redraw_line(&buf, cursor);
+                        }
+                        ctrl_c_count = 0;
+                    }
+
+                    // ── Regular char: insert at cursor ────────────────────
                     (KeyCode::Char(c), _) => {
                         if paste_content.is_none() {
-                            buf.push(c);
-                            print!("{c}");
-                            io::stdout().flush().ok();
+                            let byte_pos = buf.char_indices().nth(cursor).map(|(i,_)| i).unwrap_or(buf.len());
+                            buf.insert(byte_pos, c);
+                            cursor += 1;
+                            redraw_line(&buf, cursor);
                         }
                         ctrl_c_count = 0;
                     }
+
                     _ => {}
                 }
             }

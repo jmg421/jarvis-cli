@@ -6,6 +6,31 @@ use tokio::time::timeout;
 
 use crate::render;
 
+/// Token usage returned from a completed stream.
+#[derive(Default, Clone, Debug)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
+impl Usage {
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0
+    }
+
+    /// Estimate cost in USD using Claude Sonnet 3.7 rates
+    /// (input: $3/M, output: $15/M, cache read: $0.30/M, cache write: $3.75/M)
+    pub fn estimated_cost_usd(&self) -> f64 {
+        (self.input_tokens as f64 * 3.0
+            + self.output_tokens as f64 * 15.0
+            + self.cache_read_tokens as f64 * 0.30
+            + self.cache_write_tokens as f64 * 3.75)
+            / 1_000_000.0
+    }
+}
+
 #[derive(Serialize)]
 struct RunRequest<'a> {
     prompt: &'a str,
@@ -32,19 +57,21 @@ struct SseEvent {
     // done
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
     // context_management
     #[serde(default)]
     chars_removed: Option<u64>,
 }
 
 /// Stream a prompt to the backend, printing events as they arrive.
-/// Returns the session_id from the done event.
+/// Returns (session_id, usage) from the done event.
 pub async fn stream(
     url: &str,
     prompt: &str,
     session_id: Option<&str>,
     api_key: Option<&str>,
-) -> Result<String, String> {
+) -> Result<(String, Usage), String> {
     let client = Client::new();
     let resp = client
         .post(format!("{url}/stream"))
@@ -65,6 +92,7 @@ pub async fn stream(
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut final_session_id = session_id.unwrap_or("unknown").to_string();
+    let mut final_usage = Usage::default();
 
     loop {
         let chunk = match timeout(Duration::from_secs(120), stream.next()).await {
@@ -87,7 +115,7 @@ pub async fn stream(
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
                         render::finish();
-                        return Ok(final_session_id);
+                        return Ok((final_session_id, final_usage));
                     }
                     if let Ok(event) = serde_json::from_str::<SseEvent>(data) {
                         // Clear thinking indicator on first real event
@@ -124,6 +152,19 @@ pub async fn stream(
                                 if let Some(sid) = &event.session_id {
                                     final_session_id = sid.clone();
                                 }
+                                if let Some(usage_val) = &event.usage {
+                                    if let Some(obj) = usage_val.as_object() {
+                                        let get_u64 = |k: &str| {
+                                            obj.get(k).and_then(|v| v.as_u64()).unwrap_or(0)
+                                        };
+                                        final_usage = Usage {
+                                            input_tokens: get_u64("input_tokens"),
+                                            output_tokens: get_u64("output_tokens"),
+                                            cache_read_tokens: get_u64("cache_read_input_tokens"),
+                                            cache_write_tokens: get_u64("cache_creation_input_tokens"),
+                                        };
+                                    }
+                                }
                             }
                             "error" => {
                                 if let Some(text) = &event.text {
@@ -141,7 +182,7 @@ pub async fn stream(
     }
 
     render::finish();
-    Ok(final_session_id)
+    Ok((final_session_id, final_usage))
 }
 
 /// List sessions from the backend. Returns formatted lines ready to print.
