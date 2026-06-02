@@ -189,6 +189,59 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
             continue;
         }
 
+        // Handle !cmd — run shell command directly, no LLM, no spinner
+        if prompt.starts_with('!') {
+            let cmd = prompt[1..].trim();
+            if cmd.starts_with("cd ") || cmd == "cd" {
+                // cd is special: change the process working directory
+                let dir = cmd.strip_prefix("cd").unwrap_or("").trim();
+                let target = if dir.is_empty() {
+                    dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
+                } else if dir.starts_with('~') {
+                    let rest = dir.strip_prefix('~').unwrap_or("");
+                    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+                    if rest.is_empty() { home } else { home.join(rest.trim_start_matches('/')) }
+                } else {
+                    std::path::PathBuf::from(dir)
+                };
+                match std::env::set_current_dir(&target) {
+                    Ok(()) => println!("  \x1b[2m{}\x1b[0m\n", target.display()),
+                    Err(e) => println!("  \x1b[31m✗ cd: {e}\x1b[0m\n"),
+                }
+            } else if !cmd.is_empty() {
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .output();
+                match output {
+                    Ok(out) => {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        if !stdout.is_empty() {
+                            for line in stdout.trim_end_matches('\n').lines() {
+                                println!("  {line}");
+                            }
+                            println!();
+                        }
+                        if !stderr.is_empty() {
+                            for line in stderr.trim_end_matches('\n').lines() {
+                                println!("  \x1b[33m{line}\x1b[0m");
+                            }
+                            println!();
+                        }
+                        if stdout.is_empty() && stderr.is_empty() {
+                            // Command ran but produced no output — just a blank line
+                            println!();
+                        }
+                    }
+                    Err(e) => println!("  \x1b[31m✗ {e}\x1b[0m\n"),
+                }
+            }
+            history.push(prompt.clone());
+            save_history(&history);
+            continue;
+        }
+
         // Add to history (skip slash-commands, already handled above)
         history.push(prompt.clone());
         save_history(&history);
