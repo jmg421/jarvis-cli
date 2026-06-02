@@ -805,16 +805,19 @@ def _run_local(prompt, api_key, session_id, cancelled_flag=None):
     got_first_event = [False]
     local_cancelled = [False]
 
+    # ! commands bypass LLM — no thinking spinner
+    is_shell_cmd = prompt.strip().startswith("!")
+
     def spin():
         i = 0
         while spinning[0]:
-            if not got_first_event[0]:
+            if not got_first_event[0] and not is_shell_cmd:
                 sys.stdout.write(f"\r  {DIM}{SPINNER[i % len(SPINNER)]} thinking...{RESET}  ")
                 sys.stdout.flush()
             i += 1
             time.sleep(0.1)
         # Only clear spinner line if we were still showing it
-        if not got_first_event[0]:
+        if not got_first_event[0] and not is_shell_cmd:
             sys.stdout.write("\r" + " " * 30 + "\r")
             sys.stdout.flush()
 
@@ -837,7 +840,16 @@ def _run_local(prompt, api_key, session_id, cancelled_flag=None):
                 sys.stdout.write("\r" + " " * 30 + "\r")
                 sys.stdout.flush()
 
-            if etype == "text_delta":
+            if etype == "shell_output":
+                # ! command — raw output, no divider, no LLM framing
+                text = event.get("text", "")
+                if text:
+                    for line in text.splitlines():
+                        sys.stdout.write(f"  {line}\n")
+                    sys.stdout.flush()
+                # Don't add to streamed_text (no response to track)
+
+            elif etype == "text_delta":
                 if not text_started[0]:
                     text_started[0] = True
                     sys.stdout.write(f"  {CYAN}{'━' * 60}{RESET}\n  ")
@@ -952,7 +964,14 @@ def _run_remote(prompt, session_id, cancelled_flag=None):
                     continue
 
                 etype = event.get("type")
-                if etype == "text_delta":
+                if etype == "shell_output":
+                    # ! command — raw output, no divider
+                    text = event.get("text", "")
+                    if text:
+                        for line in text.splitlines():
+                            sys.stdout.write(f"  {line}\n")
+                        sys.stdout.flush()
+                elif etype == "text_delta":
                     if not text_started:
                         text_started = True
                         sys.stdout.write(f"  {CYAN}{'━' * 60}{RESET}\n  ")
