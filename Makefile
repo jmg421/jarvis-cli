@@ -14,7 +14,7 @@ release:
 ## install — release build → /usr/local/bin, ad-hoc codesign for macOS Gatekeeper
 install: release
 	cp target/release/$(BINARY) $(INSTALL_DIR)/$(BINARY)
-	codesign --sign - $(INSTALL_DIR)/$(BINARY)
+	codesign --force --sign - $(INSTALL_DIR)/$(BINARY)
 	@echo "✓ Installed $(INSTALL_DIR)/$(BINARY)"
 	@$(INSTALL_DIR)/$(BINARY) --help | head -1
 

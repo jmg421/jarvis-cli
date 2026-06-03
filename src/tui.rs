@@ -339,7 +339,10 @@ fn clear_paste_preview(lines_printed: usize) {
 
 fn show_paste_preview(text: &str, buf: &str) -> usize {
     let line_count = text.lines().count();
-    print!("\x1b[2K\r  \x1b[32m❯\x1b[0m ");
+    // Clear the current (possibly wrapped) input line before showing preview.
+    // Use \r\x1b[J (go to col 0, erase to end of screen) so wrapped lines are
+    // cleared too — mirrors the same fix in redraw_line.
+    print!("\r\x1b[J  \x1b[32m❯\x1b[0m ");
     if !buf.is_empty() {
         print!("{buf} ");
     }
@@ -354,26 +357,100 @@ fn show_paste_preview(text: &str, buf: &str) -> usize {
     printed
 }
 
+/// The prompt prefix displayed before user input (display columns).
+const PROMPT_COLS: usize = 4; // "  ❯ "
+
+/// Query the terminal width, defaulting to 80 if unavailable.
+fn terminal_width() -> usize {
+    // crossterm's terminal::size() returns (cols, rows)
+    crossterm::terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or(80)
+}
+
+/// How many terminal rows does `total_display_cols` columns occupy on a
+/// terminal that is `term_width` columns wide?
+fn display_rows(total_display_cols: usize, term_width: usize) -> usize {
+    if term_width == 0 { return 1; }
+    (total_display_cols.saturating_sub(1)) / term_width + 1
+}
+
 /// Redraw the input line from scratch given buffer content and cursor position (char index).
-/// The prompt is "  ❯ " (4 display columns).
+/// The prompt is "  ❯ " (PROMPT_COLS display columns).
+///
+/// When the prompt+buffer wraps across multiple terminal rows we move the
+/// cursor back to the very first row before clearing, so that stale wrapped
+/// fragments are not left on screen.
 fn redraw_line(buf: &str, cursor: usize) {
-    // cursor is a char index; convert to byte index for slicing
+    let term_w = terminal_width();
+
+    // ── How many rows does the current content occupy? ──────────────────────
+    // We count display columns using a simple heuristic: ASCII = 1 col,
+    // everything else treated as 1 col (good enough for file-path inputs).
+    let buf_display_cols: usize = buf.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+    let total_cols = PROMPT_COLS + buf_display_cols;
+    let rows_used = display_rows(total_cols, term_w).max(1);
+
+    // Move up (rows_used - 1) lines to get back to the first row, then go to
+    // column 0.  If we are already on the first row this is a no-op.
+    if rows_used > 1 {
+        print!("\x1b[{}A", rows_used - 1);
+    }
+
+    // Clear from cursor to end of screen (wipes all wrapped rows at once).
+    print!("\r\x1b[J");
+
+    // Reprint prompt + full buffer.
+    print!("  \x1b[32m❯\x1b[0m {buf}");
+
+    // ── Reposition cursor ────────────────────────────────────────────────────
+    // cursor is a char-index into buf.  Compute total display cols from the
+    // start of the prompt to the cursor position.
     let cursor_byte = buf
         .char_indices()
         .nth(cursor)
         .map(|(i, _)| i)
         .unwrap_or(buf.len());
-    let before = &buf[..cursor_byte];
+    let before_cols: usize = buf[..cursor_byte]
+        .chars()
+        .map(|c| if c.is_ascii() { 1 } else { 2 })
+        .sum();
+    let cursor_total_cols = PROMPT_COLS + before_cols;
 
-    // Clear line, reprint prompt + full buffer, then move cursor back
-    print!("\x1b[2K\r  \x1b[32m❯\x1b[0m {buf}");
+    // Chars after cursor: how far left must we move on the current row?
+    let after_cols: usize = buf[cursor_byte..]
+        .chars()
+        .map(|c| if c.is_ascii() { 1 } else { 2 })
+        .sum();
 
-    // How many chars are after the cursor? Move left by that many.
-    let after_chars = buf[cursor_byte..].chars().count();
-    if after_chars > 0 {
-        print!("\x1b[{after_chars}D");
+    // If the whole line (including chars after cursor) wraps, the physical
+    // cursor is currently at col (total_cols % term_w) on the last row.
+    // We need it at col (cursor_total_cols % term_w) on the row that contains
+    // the cursor.
+    if after_cols > 0 {
+        // rows we need to move up to reach cursor row
+        let cursor_row   = (cursor_total_cols.saturating_sub(1)) / term_w;
+        let last_row     = (total_cols.saturating_sub(1)) / term_w;
+        let rows_up      = last_row.saturating_sub(cursor_row);
+        let col_on_row   = cursor_total_cols % term_w;
+
+        if rows_up > 0 {
+            print!("\x1b[{}A", rows_up);
+        }
+        // Go to the correct column on that row.
+        // We are currently at col (total_cols % term_w); move left/right.
+        let current_col = if rows_up > 0 { term_w } else { total_cols % term_w };
+        if col_on_row < current_col {
+            print!("\x1b[{}D", current_col - col_on_row);
+        } else if col_on_row > current_col {
+            print!("\x1b[{}C", col_on_row - current_col);
+        }
+        // Edge: cursor at column 0 after moving up — \r gets us there cleanly.
+        if col_on_row == 0 {
+            print!("\r");
+        }
     }
-    let _ = before; // suppress warning
+
     io::stdout().flush().ok();
 }
 
@@ -424,7 +501,7 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                         }
                         buf.clear();
                         cursor = 0;
-                        print!("\x1b[2K\r\n  \x1b[2m(Ctrl-C again to exit)\x1b[0m\r\n  \x1b[32m❯\x1b[0m ");
+                        print!("\r\x1b[J\n  \x1b[2m(Ctrl-C again to exit)\x1b[0m\r\n  \x1b[32m❯\x1b[0m ");
                         io::stdout().flush().ok();
                     }
 
