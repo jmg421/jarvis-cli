@@ -104,8 +104,8 @@ async fn main() {
             }
         }
         let api_key = tui::load_api_key_pub();
-        match sse::stream(&cli.url, &prompt, cli.r#continue.as_deref(), api_key.as_deref()).await {
-            Ok((session_id, usage)) => {
+        match sse::stream(&cli.url, &prompt, cli.r#continue.as_deref(), api_key.as_deref(), None).await {
+            Ok((session_id, usage, _assistant_text)) => {
                 if !usage.is_empty() {
                     let cost = usage.estimated_cost_usd();
                     let iters = if usage.iterations > 0 {

@@ -48,6 +48,10 @@ fn print_help() {
     println!("  \x1b[33m/resume <id>\x1b[0m           Resume a session by ID");
     println!("  \x1b[33m/session\x1b[0m               Show current session ID");
     println!("  \x1b[33m/delete [id]\x1b[0m           Delete session (default: current)");
+    println!("  \x1b[33m/rewind [N]\x1b[0m            Jump back N turns, continue in new session");
+    println!("  \x1b[33m/effort <level>\x1b[0m        Set reasoning effort (low|medium|high|max)");
+    println!("  \x1b[33m/transcript\x1b[0m            Open conversation in $PAGER (less)");
+    println!("  \x1b[33m/changelog\x1b[0m             Show recent release notes");
     println!("  \x1b[33m/cost\x1b[0m                  Show token usage & estimated cost");
     println!("  \x1b[33m/clear\x1b[0m                 Clear the terminal screen");
     println!("  \x1b[33m/help\x1b[0m                  Show this help");
@@ -56,6 +60,51 @@ fn print_help() {
     println!("  \x1b[2mPaste: multi-line content shows preview → Enter to send, Esc to cancel\x1b[0m");
     println!("  \x1b[2mHistory: ↑/↓ arrows to navigate\x1b[0m");
     println!("  \x1b[2mLine editing: Ctrl-A/E (start/end) Ctrl-W (del word) Ctrl-U/K (clear)\x1b[0m\n");
+}
+
+/// Effort levels for model reasoning. Mirrors kiro-cli's /effort command.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl EffortLevel {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "low"    => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high"   => Some(Self::High),
+            "max"    => Some(Self::Max),
+            _        => None,
+        }
+    }
+    fn label(&self) -> &str {
+        match self {
+            Self::Low    => "low",
+            Self::Medium => "medium",
+            Self::High   => "high",
+            Self::Max    => "max",
+        }
+    }
+    /// Map to backend budget_tokens hint (approximate Claude extended thinking budget).
+    pub fn budget_tokens(&self) -> Option<u32> {
+        match self {
+            Self::Low    => Some(1_024),
+            Self::Medium => Some(4_096),
+            Self::High   => Some(10_000),
+            Self::Max    => None, // no cap — let the model decide
+        }
+    }
+}
+
+/// One turn in the local transcript (for /rewind and /transcript).
+#[derive(Clone)]
+struct TurnEntry {
+    role: &'static str,  // "user" | "assistant"
+    text: String,
 }
 
 pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
@@ -76,6 +125,10 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
     let api_key = load_api_key();
     let mut history = load_history();
     let mut cumulative_usage = Usage::default();
+    // Per-session transcript (for /rewind and /transcript)
+    let mut transcript: Vec<TurnEntry> = Vec::new();
+    // Current effort/thinking level
+    let mut effort: Option<EffortLevel> = None;
 
     println!("\n  \x1b[36m╭──────────────────────────────────────────────────╮\x1b[0m");
     println!("  \x1b[36m│\x1b[0m \x1b[1mJarvis CLI\x1b[0m — Rust TUI                          \x1b[36m│\x1b[0m");
@@ -85,7 +138,8 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
     if let Some(ref sid) = session_id {
         println!("  \x1b[2mResuming session: {sid}\x1b[0m");
     }
-    println!("  \x1b[2mType /help for commands. Ctrl-C twice to exit.\x1b[0m\n");
+    println!("  \x1b[2mType /help for commands. Ctrl-C twice to exit.\x1b[0m");
+    println!("  \x1b[2m/effort <low|medium|high|max>  •  /rewind [N]  •  /transcript\x1b[0m\n");
 
     loop {
         let prompt = match read_input(&history) {
@@ -148,7 +202,71 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
                 continue;
             }
 
+            "/changelog" => {
+                print_changelog();
+                continue;
+            }
+
+            "/transcript" => {
+                if transcript.is_empty() {
+                    println!("  \x1b[2mNo conversation yet in this session.\x1b[0m\n");
+                } else {
+                    open_transcript_in_pager(&transcript);
+                }
+                continue;
+            }
+
             _ => {}
+        }
+
+        // ── /effort <level> ──────────────────────────────────────────────────
+        if let Some(rest) = prompt.strip_prefix("/effort") {
+            let level_str = rest.trim();
+            if level_str.is_empty() {
+                let current = effort.as_ref().map(|e| e.label()).unwrap_or("default");
+                println!("  \x1b[2mCurrent effort: \x1b[33m{current}\x1b[0m");
+                println!("  \x1b[2mUsage: /effort <low|medium|high|max>\x1b[0m\n");
+            } else if let Some(e) = EffortLevel::from_str(level_str) {
+                let label = e.label().to_string();
+                effort = Some(e);
+                println!("  \x1b[32m✓\x1b[0m Effort set to \x1b[33m{label}\x1b[0m\n");
+            } else {
+                println!("  \x1b[31m✗ Unknown effort level: '{level_str}'. Use: low, medium, high, max\x1b[0m\n");
+            }
+            continue;
+        }
+
+        // ── /rewind [N] ──────────────────────────────────────────────────────
+        if let Some(rest) = prompt.strip_prefix("/rewind") {
+            let n: usize = rest.trim().parse().unwrap_or(1);
+            let n = n.max(1);
+            if transcript.is_empty() {
+                println!("  \x1b[2mNothing to rewind — no turns yet.\x1b[0m\n");
+            } else {
+                // Count user turns and drop the last N
+                let user_turns: Vec<usize> = transcript
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.role == "user")
+                    .map(|(i, _)| i)
+                    .collect();
+                let keep = user_turns.len().saturating_sub(n);
+                let keep_idx = user_turns.get(keep).copied().unwrap_or(0);
+                transcript.truncate(keep_idx);
+                // Reset session so next message starts fresh with rewound context
+                session_id = None;
+                let kept = keep;
+                let dropped = user_turns.len().saturating_sub(kept);
+                println!("  \x1b[32m↩\x1b[0m Rewound {dropped} turn(s). Session reset — next prompt starts a new session.\n");
+                if !transcript.is_empty() {
+                    println!("  \x1b[2mLast kept prompt:\x1b[0m");
+                    if let Some(last_user) = transcript.iter().rev().find(|t| t.role == "user") {
+                        let preview: String = last_user.text.chars().take(120).collect();
+                        println!("  \x1b[2m│\x1b[0m {preview}\n");
+                    }
+                }
+            }
+            continue;
         }
 
         // Handle /delete <id> with explicit session id
@@ -246,8 +364,15 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
         history.push(prompt.clone());
         save_history(&history);
 
-        match sse::stream(&url, &prompt, session_id.as_deref(), api_key.as_deref()).await {
-            Ok((new_session_id, usage)) => {
+        // Record user turn in transcript
+        transcript.push(TurnEntry { role: "user", text: prompt.clone() });
+
+        let budget = effort.as_ref().and_then(|e| e.budget_tokens());
+        match sse::stream(&url, &prompt, session_id.as_deref(), api_key.as_deref(), budget).await {
+            Ok((new_session_id, usage, assistant_text)) => {
+                // Record assistant reply in transcript
+                transcript.push(TurnEntry { role: "assistant", text: assistant_text });
+
                 // Accumulate usage across all turns
                 cumulative_usage.input_tokens += usage.input_tokens;
                 cumulative_usage.output_tokens += usage.output_tokens;
@@ -261,8 +386,9 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
                     } else {
                         String::new()
                     };
+                    let effort_tag = effort.as_ref().map(|e| format!("  effort:{}", e.label())).unwrap_or_default();
                     println!(
-                        "  \x1b[2msession: {new_session_id}  ·  {}↑ {}↓  ~${cost:.4}{iters}\x1b[0m\n",
+                        "  \x1b[2msession: {new_session_id}  ·  {}↑ {}↓  ~${cost:.4}{iters}{effort_tag}\x1b[0m\n",
                         fmt_tokens(usage.input_tokens),
                         fmt_tokens(usage.output_tokens),
                     );
@@ -272,6 +398,8 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
                 session_id = Some(new_session_id);
             }
             Err(e) => {
+                // Remove the user turn we just added since this failed
+                transcript.pop();
                 println!("  \x1b[31m✗ {e}\x1b[0m\n");
             }
         }
@@ -289,6 +417,75 @@ fn fmt_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+fn print_changelog() {
+    println!("\n  \x1b[1;36mJarvis CLI — Recent Changes\x1b[0m");
+    println!("  \x1b[2m─────────────────────────────────────────────────────────\x1b[0m");
+    println!("  \x1b[1;33mNext release\x1b[0m  \x1b[2m(kiro-parity-2025 branch)\x1b[0m");
+    println!("  \x1b[32m+\x1b[0m Added \x1b[33m/rewind [N]\x1b[0m  — jump back N turns, continue fresh");
+    println!("  \x1b[32m+\x1b[0m Added \x1b[33m/effort <level>\x1b[0m — control reasoning budget");
+    println!("    \x1b[2mlevels: low (1k tok) · medium (4k) · high (10k) · max (no cap)\x1b[0m");
+    println!("  \x1b[32m+\x1b[0m Added \x1b[33m/transcript\x1b[0m — open session history in $PAGER");
+    println!("  \x1b[32m+\x1b[0m Added \x1b[33m/changelog\x1b[0m  — this command");
+    println!("  \x1b[32m+\x1b[0m Thinking display: agent reasoning shown in real-time");
+    println!("  \x1b[32m+\x1b[0m Effort hint passed to backend as budget_tokens param");
+    println!("  \x1b[32m+\x1b[0m Double Ctrl-C required to exit (prevents accidental quit)");
+    println!("  \x1b[32m+\x1b[0m Session transcript recorded per-session for /rewind + /transcript");
+    println!("  \x1b[32m+\x1b[0m Effort level shown in per-turn usage footer");
+    println!();
+    println!("  \x1b[1;33mv0.1.0\x1b[0m  \x1b[2m(initial release)\x1b[0m");
+    println!("  \x1b[32m+\x1b[0m Interactive TUI with raw-mode input, history, paste preview");
+    println!("  \x1b[32m+\x1b[0m Session management: /new, /sessions, /resume, /delete");
+    println!("  \x1b[32m+\x1b[0m Cost tracking: /cost, per-turn usage footer");
+    println!("  \x1b[32m+\x1b[0m Shell escape: !cmd, !cd");
+    println!("  \x1b[32m+\x1b[0m Daemon auto-start and health checking");
+    println!("  \x1b[32m+\x1b[0m Non-interactive pipe mode: echo \"task\" | jarvis");
+    println!("  \x1b[32m+\x1b[0m Word-wrap-aware cursor for wide terminals");
+    println!("  \x1b[2m─────────────────────────────────────────────────────────\x1b[0m\n");
+}
+
+fn open_transcript_in_pager(transcript: &[TurnEntry]) {
+    // Build the transcript text
+    let mut text = String::new();
+    text.push_str("Jarvis CLI — Session Transcript\n");
+    text.push_str("════════════════════════════════════════\n\n");
+    for (i, turn) in transcript.iter().enumerate() {
+        let role_label = match turn.role {
+            "user"      => "You",
+            "assistant" => "Jarvis",
+            other       => other,
+        };
+        text.push_str(&format!("[{}] {}\n", i + 1, role_label));
+        text.push_str(&"─".repeat(40));
+        text.push('\n');
+        text.push_str(&turn.text);
+        text.push_str("\n\n");
+    }
+
+    // Write to a temp file and open in $PAGER (default: less)
+    let tmp = std::env::temp_dir().join("jarvis_transcript.txt");
+    if let Err(e) = fs::write(&tmp, &text) {
+        println!("  \x1b[31m✗ Failed to write transcript: {e}\x1b[0m\n");
+        return;
+    }
+
+    let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
+    // Disable raw mode so the pager works properly
+    disable_raw_mode().ok();
+    let status = std::process::Command::new(&pager)
+        .arg(&tmp)
+        .status();
+    enable_raw_mode().ok();
+
+    match status {
+        Ok(_) => {}
+        Err(e) => {
+            // Fallback: just print to stdout
+            println!("  \x1b[33m⚠ Could not launch '{pager}': {e}\x1b[0m");
+            println!("  \x1b[2mTranscript written to: {}\x1b[0m\n", tmp.display());
+        }
     }
 }
 

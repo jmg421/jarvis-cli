@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 static IN_TEXT: AtomicBool = AtomicBool::new(false);
+/// Whether a thinking block is currently open (started but not yet closed).
+static IN_THINKING: AtomicBool = AtomicBool::new(false);
 
 // ── Animated spinner ────────────────────────────────────────────────────────
 
@@ -120,7 +122,27 @@ pub fn thinking() -> SpinnerHandle {
     SpinnerHandle::start("thinking...")
 }
 
+/// Stream a chunk of the agent's internal reasoning (kiro 2.5.0 style thinking display).
+/// Renders in dim italic to visually separate from the response text.
+pub fn thinking_delta(chunk: &str) {
+    if !IN_THINKING.swap(true, Ordering::Relaxed) {
+        // Opening line — dim header
+        print!("\n  \x1b[2m╭─ thinking ──────────────────────────────────────\x1b[0m\n");
+        print!("  \x1b[2m│\x1b[0m ");
+    }
+    // Indent continuation lines with dim pipe
+    let formatted = chunk.replace('\n', "\n  \x1b[2m│\x1b[0m ");
+    print!("\x1b[2m{formatted}\x1b[0m");
+    io::stdout().flush().ok();
+}
 
+/// Close an open thinking block (if any).
+pub fn finish_thinking() {
+    if IN_THINKING.swap(false, Ordering::Relaxed) {
+        println!();
+        println!("  \x1b[2m╰─────────────────────────────────────────────────\x1b[0m");
+    }
+}
 
 pub fn finish() {
     IN_TEXT.store(false, Ordering::Relaxed);

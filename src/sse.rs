@@ -39,15 +39,21 @@ struct RunRequest<'a> {
     session_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     api_key: Option<&'a str>,
+    /// Extended-thinking token budget (None = use backend default / no extended thinking)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
 struct SseEvent {
     #[serde(rename = "type")]
     event_type: String,
-    // text_delta / error
+    // text_delta / error / thinking
     #[serde(default)]
     text: Option<String>,
+    // thinking
+    #[serde(default)]
+    thinking: Option<String>,
     // tool_call / tool_result
     #[serde(default)]
     name: Option<String>,
@@ -69,17 +75,18 @@ struct SseEvent {
 }
 
 /// Stream a prompt to the backend, printing events as they arrive.
-/// Returns (session_id, usage) from the done event.
+/// Returns (session_id, usage, assistant_text) from the done event.
 pub async fn stream(
     url: &str,
     prompt: &str,
     session_id: Option<&str>,
     api_key: Option<&str>,
-) -> Result<(String, Usage), String> {
+    budget_tokens: Option<u32>,
+) -> Result<(String, Usage, String), String> {
     let client = Client::new();
     let resp = client
         .post(format!("{url}/stream"))
-        .json(&RunRequest { prompt, session_id, api_key })
+        .json(&RunRequest { prompt, session_id, api_key, budget_tokens })
         .header("Accept", "text/event-stream")
         .send()
         .await
@@ -97,6 +104,8 @@ pub async fn stream(
     let mut buffer = String::new();
     let mut final_session_id = session_id.unwrap_or("unknown").to_string();
     let mut final_usage = Usage::default();
+    // Accumulate assistant text for transcript
+    let mut assistant_text = String::new();
 
     loop {
         let chunk = match timeout(Duration::from_secs(180), stream.next()).await {
@@ -120,16 +129,24 @@ pub async fn stream(
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
                         drop(spinner.take());
+                        render::finish_thinking();
                         render::finish();
-                        return Ok((final_session_id, final_usage));
+                        return Ok((final_session_id, final_usage, assistant_text));
                     }
                     if let Ok(event) = serde_json::from_str::<SseEvent>(data) {
                         // Drop spinner on first real event (clears the line)
                         drop(spinner.take());
 
                         match event.event_type.as_str() {
+                            "thinking" => {
+                                // Show agent reasoning in real-time (kiro 2.5.0 parity)
+                                if let Some(thought) = event.thinking.as_ref().or(event.text.as_ref()) {
+                                    render::thinking_delta(thought);
+                                }
+                            }
                             "text_delta" => {
                                 if let Some(text) = &event.text {
+                                    assistant_text.push_str(text);
                                     render::text_delta(text);
                                 }
                             }
@@ -153,6 +170,7 @@ pub async fn stream(
                             }
                             "done" => {
                                 drop(spinner.take());
+                                render::finish_thinking(); // close any open thinking block
                                 if let Some(sid) = &event.session_id {
                                     final_session_id = sid.clone();
                                 }
@@ -186,8 +204,9 @@ pub async fn stream(
         }
     }
 
+    render::finish_thinking();
     render::finish();
-    Ok((final_session_id, final_usage))
+    Ok((final_session_id, final_usage, assistant_text))
 }
 
 /// List sessions from the backend. Returns formatted lines ready to print.
