@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::{daemon, sse, sse::Usage};
 
@@ -121,6 +122,21 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
         println!("  \x1b[31m✗ {e}\x1b[0m");
         println!("  \x1b[2mStart manually: cd ~/repos/jarvis-agent && uvicorn jarvis_agent.server:app --port 8100\x1b[0m\n");
     }
+
+    // ── Enable raw mode ONCE for the entire session ─────────────────────────
+    //
+    // Root cause fix: previously raw mode was toggled in read_input() —
+    // enabled on entry, disabled on return.  That meant during sse::stream()
+    // the terminal was in cooked (line-buffered) mode, so:
+    //   • Esc was swallowed by the OS line discipline (never reached crossterm)
+    //   • Ctrl-C was delivered as SIGINT to the process, not as a crossterm
+    //     key event, so the key_watcher thread never saw it
+    //
+    // Keeping raw mode on the whole time means every keypress goes straight
+    // to crossterm's event queue — both read_input() and the key_watcher
+    // thread during streaming see events reliably.
+    enable_raw_mode().ok();
+    execute!(io::stdout(), EnableBracketedPaste).ok();
 
     let api_key = load_api_key();
     let mut history = load_history();
@@ -412,8 +428,23 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
             &url, &prompt, session_id.as_deref(), api_key.as_deref(), budget, cancel_rx,
         ).await;
 
-        // Signal the key-watcher thread to exit (it may already have)
+        // Signal the key-watcher thread to exit (it may already have).
         done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Drain any residual keypress events from the crossterm queue.
+        //
+        // When the user pressed Esc/Ctrl-C to cancel, the key_watcher thread
+        // consumed that event.  But if they pressed multiple keys (e.g. held
+        // Ctrl-C) there may be extras sitting in the queue.  If we don't drain
+        // them, read_input_raw() will immediately see a Ctrl-C on the next
+        // turn and either clear the buffer or exit.
+        //
+        // We give the key_watcher thread a brief moment to finish its last
+        // event::read() call before we start draining (they share the queue).
+        std::thread::sleep(Duration::from_millis(30));
+        while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+            let _ = event::read();
+        }
 
         match stream_result {
             Ok((new_session_id, usage, assistant_text)) => {
@@ -458,6 +489,9 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
         }
     }
 
+    // ── Restore terminal on clean exit ──────────────────────────────────────
+    execute!(io::stdout(), DisableBracketedPaste).ok();
+    disable_raw_mode().ok();
     println!("\n  \x1b[2mGoodbye.\x1b[0m\n");
 }
 
@@ -562,16 +596,17 @@ fn print_cost(usage: &Usage) {
     println!("  Estimated cost:       \x1b[32m~${total_cost:.4}\x1b[0m  \x1b[2m(Claude Sonnet 3.7 rates)\x1b[0m\n");
 }
 
+/// Read one line of input from the user.
+///
+/// Raw mode and bracketed-paste MUST already be enabled by the caller (the
+/// `run()` loop enables them once at startup and keeps them on the whole
+/// time, including during streaming).  We do NOT toggle raw mode here —
+/// that was the root cause of Esc/Ctrl-C being swallowed during streaming.
 fn read_input(history: &[String]) -> Option<String> {
     print!("  \x1b[32m❯\x1b[0m ");
     io::stdout().flush().ok();
 
-    enable_raw_mode().ok();
-    execute!(io::stdout(), EnableBracketedPaste).ok();
     let result = read_input_raw(history);
-    execute!(io::stdout(), DisableBracketedPaste).ok();
-    disable_raw_mode().ok();
-
     println!();
     result
 }
@@ -709,6 +744,9 @@ fn read_input_raw(history: &[String]) -> Option<String> {
     // cursor is a char-index (not byte-index) into buf
     let mut cursor: usize = 0;
     let mut ctrl_c_count = 0u8;
+    // Timestamp of the last Ctrl-C press — used for 2-second decay window.
+    // Two Ctrl-C presses within 2s exits; after 2s the count resets.
+    let mut ctrl_c_last: Option<Instant> = None;
     let mut paste_content: Option<String> = None;
     let mut paste_lines_printed: usize = 0;
     let mut hist_idx: usize = history.len();
@@ -718,7 +756,14 @@ fn read_input_raw(history: &[String]) -> Option<String> {
     let char_count = |s: &str| s.chars().count();
 
     loop {
-        if !event::poll(Duration::from_millis(500)).unwrap_or(false) {
+        if !event::poll(Duration::from_millis(100)).unwrap_or(false) {
+            // Decay ctrl_c_count if 2s have elapsed since the last press.
+            if ctrl_c_count > 0 {
+                if ctrl_c_last.map(|t| t.elapsed().as_secs() >= 2).unwrap_or(false) {
+                    ctrl_c_count = 0;
+                    ctrl_c_last = None;
+                }
+            }
             continue;
         }
 
@@ -740,7 +785,12 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                 match (code, modifiers) {
                     // ── Exit / cancel ────────────────────────────────────
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        // Decay: if the previous Ctrl-C was >2s ago, start fresh.
+                        if ctrl_c_last.map(|t| t.elapsed().as_secs() >= 2).unwrap_or(false) {
+                            ctrl_c_count = 0;
+                        }
                         ctrl_c_count += 1;
+                        ctrl_c_last = Some(Instant::now());
                         if ctrl_c_count >= 2 {
                             return None;
                         }
@@ -751,7 +801,7 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                         }
                         buf.clear();
                         cursor = 0;
-                        print!("\r\x1b[J\n  \x1b[2m(Ctrl-C again to exit)\x1b[0m\r\n  \x1b[32m❯\x1b[0m ");
+                        print!("\r\x1b[J\n  \x1b[2m(Ctrl-C again within 2s to exit)\x1b[0m\r\n  \x1b[32m❯\x1b[0m ");
                         io::stdout().flush().ok();
                     }
 
@@ -877,14 +927,22 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                         }
                     }
 
-                    // ── Escape: cancel paste preview ──────────────────────
+                    // ── Escape: cancel paste preview, or clear line ───────
                     (KeyCode::Esc, _) => {
                         if paste_content.is_some() {
                             clear_paste_preview(paste_lines_printed);
                             paste_content = None;
                             paste_lines_printed = 0;
                             redraw_line(&buf, cursor);
+                        } else if !buf.is_empty() {
+                            // Esc with text in buffer: clear the line (like Ctrl-C but stay)
+                            buf.clear();
+                            cursor = 0;
+                            redraw_line(&buf, cursor);
                         }
+                        // Esc with empty buffer is a no-op at the prompt —
+                        // interrupt during streaming is handled by the key_watcher
+                        // in run() which reads from the same raw-mode event queue.
                     }
 
                     // ── Enter: submit ─────────────────────────────────────
@@ -912,7 +970,8 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                             cursor -= 1;
                             redraw_line(&buf, cursor);
                         }
-                        ctrl_c_count = 0;
+                        // NOTE: do NOT reset ctrl_c_count here.
+                        // The 2-second timer decay in the poll() branch handles expiry.
                     }
 
                     // ── Delete: delete char at cursor ─────────────────────
@@ -923,7 +982,7 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                             buf.drain(byte_pos..next_byte);
                             redraw_line(&buf, cursor);
                         }
-                        ctrl_c_count = 0;
+                        // NOTE: do NOT reset ctrl_c_count here.
                     }
 
                     // ── Regular char: insert at cursor ────────────────────
@@ -934,7 +993,7 @@ fn read_input_raw(history: &[String]) -> Option<String> {
                             cursor += 1;
                             redraw_line(&buf, cursor);
                         }
-                        ctrl_c_count = 0;
+                        // NOTE: do NOT reset ctrl_c_count here.
                     }
 
                     _ => {}

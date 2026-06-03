@@ -91,13 +91,29 @@ pub async fn stream(
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(String, Usage, String), String> {
     let client = Client::new();
-    let resp = client
+
+    // ── Cancel-aware HTTP connect ────────────────────────────────────────────
+    //
+    // Root cause fix: previously client.send().await was NOT inside a
+    // select!, so if the user pressed Esc during the connect phase (which
+    // can take several seconds on a cold backend start) the cancel signal
+    // was set but nobody was watching it yet.  The stream loop would only
+    // start checking cancel *after* the connection was established.
+    let connect_fut = client
         .post(format!("{url}/stream"))
         .json(&RunRequest { prompt, session_id, api_key, budget_tokens })
         .header("Accept", "text/event-stream")
-        .send()
-        .await
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .send();
+
+    let resp = tokio::select! {
+        biased;
+        _ = cancel.changed() => {
+            return Err(CANCELLED.to_string());
+        }
+        result = connect_fut => {
+            result.map_err(|e| format!("Connection failed: {e}"))?
+        }
+    };
 
     if !resp.status().is_success() {
         return Err(format!("Backend returned {}", resp.status()));
