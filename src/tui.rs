@@ -369,28 +369,25 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
 
         let budget = effort.as_ref().and_then(|e| e.budget_tokens());
 
-        // ── Esc-to-interrupt: race the stream against a key-reader thread ──
+        // ── Esc-to-interrupt ─────────────────────────────────────────────
         //
-        // raw-mode is currently ON (we're in the prompt loop).  We need to
-        // keep it on so the key-reader can see individual keypresses, but we
-        // also need the stream future to run.  We do this with a oneshot
-        // channel: a background std::thread polls crossterm for Esc / Ctrl-C
-        // and fires the channel; tokio::select! cancels the stream task when
-        // that fires.
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        // We thread a tokio::sync::watch channel into sse::stream.  When the
+        // key-watcher thread sets the watch value to `true`, the stream's
+        // internal tokio::select! (on every chunk await) wakes immediately,
+        // calls finish_thinking() + finish() from *inside* the loop, and
+        // returns Err(CANCELLED).  This avoids all races between the spinner
+        // thread cleanup and the cancel branch printing.
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-        // Spawn the key-watcher thread.  It blocks on crossterm events;
-        // the `done_flag` lets us signal it to exit once the stream finishes
-        // normally so we don't leave a zombie thread.
+        // Background thread: poll crossterm for Esc or Ctrl-C.
+        // `done_flag` is set after stream() returns so the thread self-exits.
         let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done_flag2 = done_flag.clone();
         let _key_watcher = std::thread::spawn(move || {
-            let mut tx = Some(cancel_tx);
             loop {
                 if done_flag2.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                // Poll with a short timeout so done_flag is checked frequently
                 match event::poll(Duration::from_millis(50)) {
                     Ok(true) => {
                         if let Ok(Event::Key(ke)) = event::read() {
@@ -400,9 +397,8 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
                                     (KeyCode::Char('c'), KeyModifiers::CONTROL)
                                 );
                             if is_cancel {
-                                if let Some(t) = tx.take() {
-                                    let _ = t.send(());
-                                }
+                                // Signal the stream — it will clean up & return CANCELLED
+                                let _ = cancel_tx.send(true);
                                 break;
                             }
                         }
@@ -412,23 +408,15 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
             }
         });
 
-        // Race the stream against the cancel signal
-        let stream_result = tokio::select! {
-            result = sse::stream(&url, &prompt, session_id.as_deref(), api_key.as_deref(), budget) => {
-                done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                Some(result)
-            }
-            _ = cancel_rx => {
-                done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                // Flush any partial output and print the interrupt notice
-                crate::render::finish_thinking();
-                println!("\n  \x1b[2m^interrupted\x1b[0m\n");
-                None
-            }
-        };
+        let stream_result = sse::stream(
+            &url, &prompt, session_id.as_deref(), api_key.as_deref(), budget, cancel_rx,
+        ).await;
+
+        // Signal the key-watcher thread to exit (it may already have)
+        done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
 
         match stream_result {
-            Some(Ok((new_session_id, usage, assistant_text))) => {
+            Ok((new_session_id, usage, assistant_text)) => {
                 // Record assistant reply in transcript
                 transcript.push(TurnEntry { role: "assistant", text: assistant_text });
 
@@ -456,15 +444,16 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
                 }
                 session_id = Some(new_session_id);
             }
-            Some(Err(e)) => {
-                // Remove the user turn we just added since this failed
+            Err(e) if e == sse::CANCELLED => {
+                // Clean cancel — sse::stream already called finish_thinking()+finish()
+                // Just print the notice and pop the pending transcript entry.
+                println!("  \x1b[2m^interrupted\x1b[0m\n");
+                transcript.pop();
+            }
+            Err(e) => {
+                // Real error — pop the pending user turn
                 transcript.pop();
                 println!("  \x1b[31m✗ {e}\x1b[0m\n");
-            }
-            None => {
-                // Cancelled by Esc / Ctrl-C — pop the pending user turn so
-                // transcript stays consistent and the session is clean.
-                transcript.pop();
             }
         }
     }

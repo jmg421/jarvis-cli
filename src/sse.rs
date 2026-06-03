@@ -74,14 +74,21 @@ struct SseEvent {
     iterations: Option<u64>,
 }
 
+/// Sentinel error string returned when the caller cancels via the watch channel.
+pub const CANCELLED: &str = "__cancelled__";
+
 /// Stream a prompt to the backend, printing events as they arrive.
 /// Returns (session_id, usage, assistant_text) from the done event.
+///
+/// `cancel` — a `watch::Receiver<bool>`.  When the sender sets the value to
+/// `true` the stream loop exits immediately with `Err(CANCELLED)`.
 pub async fn stream(
     url: &str,
     prompt: &str,
     session_id: Option<&str>,
     api_key: Option<&str>,
     budget_tokens: Option<u32>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(String, Usage, String), String> {
     let client = Client::new();
     let resp = client
@@ -108,13 +115,34 @@ pub async fn stream(
     let mut assistant_text = String::new();
 
     loop {
-        let chunk = match timeout(Duration::from_secs(180), stream.next()).await {
-            Ok(Some(c)) => c,
-            Ok(None) => break,
-            Err(_) => {
+        // Check for cancellation before blocking on the next chunk
+        if *cancel.borrow() {
+            drop(spinner.take());
+            render::finish_thinking();
+            render::finish();
+            return Err(CANCELLED.to_string());
+        }
+
+        // Race the next chunk against a cancel signal and a 180s timeout.
+        // cancel.changed() resolves the moment the sender writes `true`.
+        let chunk = tokio::select! {
+            biased;                          // check cancel first, every iteration
+            _ = cancel.changed() => {
                 drop(spinner.take());
+                render::finish_thinking();
                 render::finish();
-                return Err("Stream timeout: no data for 180s".to_string());
+                return Err(CANCELLED.to_string());
+            }
+            result = timeout(Duration::from_secs(180), stream.next()) => {
+                match result {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(_) => {
+                        drop(spinner.take());
+                        render::finish();
+                        return Err("Stream timeout: no data for 180s".to_string());
+                    }
+                }
             }
         };
         let chunk = chunk.map_err(|e| format!("Stream error: {e}"))?;

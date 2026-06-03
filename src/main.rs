@@ -104,7 +104,8 @@ async fn main() {
             }
         }
         let api_key = tui::load_api_key_pub();
-        match sse::stream(&cli.url, &prompt, cli.r#continue.as_deref(), api_key.as_deref(), None).await {
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        match sse::stream(&cli.url, &prompt, cli.r#continue.as_deref(), api_key.as_deref(), None, cancel_rx).await {
             Ok((session_id, usage, _assistant_text)) => {
                 if !usage.is_empty() {
                     let cost = usage.estimated_cost_usd();

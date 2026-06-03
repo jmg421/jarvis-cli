@@ -41,8 +41,12 @@ impl SpinnerHandle {
 impl Drop for SpinnerHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Detach rather than join — joining blocks the caller (especially bad
+        // when dropped inside a tokio::select! cancel branch on an async
+        // executor thread).  The spinner thread checks the flag every 80ms
+        // and will exit + clear its line on its own.
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            drop(t); // detach
         }
     }
 }
