@@ -123,20 +123,18 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
         println!("  \x1b[2mStart manually: cd ~/repos/jarvis-agent && uvicorn jarvis_agent.server:app --port 8100\x1b[0m\n");
     }
 
-    // ── Enable raw mode ONCE for the entire session ─────────────────────────
+    // Raw mode is enabled only when we actually need it:
+    //   1. Inside read_input() / read_input_raw() — for line editing
+    //   2. During sse::stream() — so the key_watcher spawn_blocking thread
+    //      sees Esc/Ctrl-C events before the OS line discipline swallows them
     //
-    // Root cause fix: previously raw mode was toggled in read_input() —
-    // enabled on entry, disabled on return.  That meant during sse::stream()
-    // the terminal was in cooked (line-buffered) mode, so:
-    //   • Esc was swallowed by the OS line discipline (never reached crossterm)
-    //   • Ctrl-C was delivered as SIGINT to the process, not as a crossterm
-    //     key event, so the key_watcher thread never saw it
+    // All other output (banner, command results, error messages) is printed
+    // in cooked mode so that plain println! works correctly — \n resets to
+    // column 0.  Keeping raw mode on for the whole session caused every
+    // println! to staircase because \n doesn't CR in raw mode.
     //
-    // Keeping raw mode on the whole time means every keypress goes straight
-    // to crossterm's event queue — both read_input() and the key_watcher
-    // thread during streaming see events reliably.
-    enable_raw_mode().ok();
-    execute!(io::stdout(), EnableBracketedPaste).ok();
+    // Bracketed paste is toggled alongside raw mode in read_input().
+
 
     let api_key = load_api_key();
     let mut history = load_history();
@@ -393,6 +391,11 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
         // calls finish_thinking() + finish() from *inside* the loop, and
         // returns Err(CANCELLED).  This avoids all races between the spinner
         // thread cleanup and the cancel branch printing.
+        // Enable raw mode for the duration of streaming so that the
+        // key_watcher spawn_blocking thread receives Esc/Ctrl-C events
+        // directly instead of having them swallowed by the OS line discipline.
+        enable_raw_mode().ok();
+
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
         // ── Key-watcher: owns the crossterm event queue during streaming ─────
@@ -465,6 +468,10 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
         stream_done.store(true, std::sync::atomic::Ordering::Release);
         let _ = watcher_handle.await;
 
+        // Back to cooked mode — all response/command output uses println!
+        // which emits \n (not \r\n), so cooked mode is required.
+        disable_raw_mode().ok();
+
         match stream_result {
             Ok((new_session_id, usage, assistant_text)) => {
                 // Record assistant reply in transcript
@@ -509,7 +516,10 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
     }
 
     // ── Restore terminal on clean exit ──────────────────────────────────────
-    execute!(io::stdout(), DisableBracketedPaste).ok();
+    // Raw mode and bracketed paste are only held during read_input() and
+    // during streaming — both are always cleaned up on their own paths.
+    // Call disable here defensively in case of an early break mid-stream.
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     disable_raw_mode().ok();
     println!("\n  \x1b[2mGoodbye.\x1b[0m\n");
 }
@@ -617,16 +627,24 @@ fn print_cost(usage: &Usage) {
 
 /// Read one line of input from the user.
 ///
-/// Raw mode and bracketed-paste MUST already be enabled by the caller (the
-/// `run()` loop enables them once at startup and keeps them on the whole
-/// time, including during streaming).  We do NOT toggle raw mode here —
-/// that was the root cause of Esc/Ctrl-C being swallowed during streaming.
+/// Enables raw mode + bracketed paste just for the duration of the read,
+/// then restores cooked mode so that subsequent println! output works
+/// correctly (\n resets to column 0).
 fn read_input(history: &[String]) -> Option<String> {
+    enable_raw_mode().ok();
+    execute!(io::stdout(), EnableBracketedPaste).ok();
+
     print!("  \x1b[32m❯\x1b[0m ");
     io::stdout().flush().ok();
 
     let result = read_input_raw(history);
-    println!();
+
+    execute!(io::stdout(), DisableBracketedPaste).ok();
+    disable_raw_mode().ok();
+    // In cooked mode \n does CR+LF, but we're transitioning from raw where
+    // the cursor is still on the input line — print \r\n to move cleanly.
+    print!("\r\n");
+    io::stdout().flush().ok();
     result
 }
 
