@@ -395,28 +395,59 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
         // thread cleanup and the cancel branch printing.
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-        // Background thread: poll crossterm for Esc or Ctrl-C.
-        // `done_flag` is set after stream() returns so the thread self-exits.
-        let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let done_flag2 = done_flag.clone();
-        let _key_watcher = std::thread::spawn(move || {
+        // ── Key-watcher: owns the crossterm event queue during streaming ─────
+        //
+        // Root cause of the previous race: std::thread::spawn shares the
+        // crossterm event queue with the main thread.  poll() doesn't consume
+        // events, so a drain loop on the main thread could steal the very
+        // event the watcher had already poll()'d as ready, leaving the
+        // watcher blocked on read() while the drain loop had consumed its
+        // event — and subsequent user keypresses were then consumed by the
+        // stuck watcher thread instead of read_input_raw().
+        //
+        // Fix: use spawn_blocking so the watcher runs on a dedicated OS thread
+        // that we AWAIT before touching the event queue again.  The watcher
+        // is the *sole* owner of crossterm events while it is alive.  After
+        // it returns we are guaranteed no other thread is inside event::read().
+        //
+        // Protocol:
+        //   • watcher polls with a 50 ms timeout
+        //   • on Esc / Ctrl-C it sends cancel, drains its own extras, returns
+        //   • stream_done is set to true by the stream fut via a shared atomic;
+        //     on the next poll timeout the watcher checks and returns cleanly
+        let stream_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream_done2 = stream_done.clone();
+
+        let watcher_handle = tokio::task::spawn_blocking(move || {
             loop {
-                if done_flag2.load(std::sync::atomic::Ordering::Relaxed) {
+                // Exit if the stream finished on its own (no cancel needed).
+                if stream_done2.load(std::sync::atomic::Ordering::Acquire) {
+                    // Drain any stale events before handing the queue back.
+                    while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+                        let _ = event::read();
+                    }
                     break;
                 }
                 match event::poll(Duration::from_millis(50)) {
                     Ok(true) => {
-                        if let Ok(Event::Key(ke)) = event::read() {
-                            let is_cancel = matches!(ke.code, KeyCode::Esc)
-                                || matches!(
-                                    (ke.code, ke.modifiers),
-                                    (KeyCode::Char('c'), KeyModifiers::CONTROL)
-                                );
-                            if is_cancel {
-                                // Signal the stream — it will clean up & return CANCELLED
-                                let _ = cancel_tx.send(true);
-                                break;
+                        match event::read() {
+                            Ok(Event::Key(ke)) => {
+                                let is_cancel = matches!(ke.code, KeyCode::Esc)
+                                    || matches!(
+                                        (ke.code, ke.modifiers),
+                                        (KeyCode::Char('c'), KeyModifiers::CONTROL)
+                                    );
+                                if is_cancel {
+                                    let _ = cancel_tx.send(true);
+                                    // Drain any extras the user may have queued.
+                                    while event::poll(Duration::from_millis(50)).unwrap_or(false) {
+                                        let _ = event::read();
+                                    }
+                                    break;
+                                }
+                                // Any other key during streaming is silently dropped.
                             }
+                            _ => {}
                         }
                     }
                     _ => {}
@@ -428,23 +459,11 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
             &url, &prompt, session_id.as_deref(), api_key.as_deref(), budget, cancel_rx,
         ).await;
 
-        // Signal the key-watcher thread to exit (it may already have).
-        done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // Drain any residual keypress events from the crossterm queue.
-        //
-        // When the user pressed Esc/Ctrl-C to cancel, the key_watcher thread
-        // consumed that event.  But if they pressed multiple keys (e.g. held
-        // Ctrl-C) there may be extras sitting in the queue.  If we don't drain
-        // them, read_input_raw() will immediately see a Ctrl-C on the next
-        // turn and either clear the buffer or exit.
-        //
-        // We give the key_watcher thread a brief moment to finish its last
-        // event::read() call before we start draining (they share the queue).
-        std::thread::sleep(Duration::from_millis(30));
-        while event::poll(Duration::from_millis(0)).unwrap_or(false) {
-            let _ = event::read();
-        }
+        // Tell the watcher the stream is done, then await it fully.
+        // This guarantees: when we reach read_input_raw(), the watcher thread
+        // has exited and is no longer touching the crossterm event queue.
+        stream_done.store(true, std::sync::atomic::Ordering::Release);
+        let _ = watcher_handle.await;
 
         match stream_result {
             Ok((new_session_id, usage, assistant_text)) => {

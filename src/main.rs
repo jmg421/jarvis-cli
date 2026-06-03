@@ -5,6 +5,7 @@ mod sse;
 mod tui;
 
 use clap::Parser;
+use crossterm;
 
 #[derive(Parser)]
 #[command(name = "jarvis", about = "Agentic development CLI — introspect • synthesize • build")]
@@ -130,6 +131,19 @@ async fn main() {
         }
         return;
     }
+
+    // Install a panic hook that restores the terminal before printing the
+    // panic message.  Without this, a Rust panic while raw mode is active
+    // leaves the terminal in raw mode — the shell becomes unusable.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableBracketedPaste
+        );
+        default_hook(info);
+    }));
 
     tui::run(cli.url, cli.r#continue, cli.no_daemon).await;
     // Note: we intentionally do NOT stop the daemon here — it's a long-running
