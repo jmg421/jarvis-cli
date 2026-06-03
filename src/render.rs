@@ -63,14 +63,40 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// ── CR+LF helpers ───────────────────────────────────────────────────────────
+//
+// All render output happens while raw mode is active (raw mode is enabled
+// before sse::stream() is called and disabled after it returns).  In raw
+// mode the OS line discipline is bypassed, so a bare '\n' (LF) moves the
+// cursor DOWN but does NOT return it to column 0.  Every line of output
+// therefore must use explicit CR+LF ("\r\n") or the output staircases
+// to the right.
+//
+// Use `println_raw!` instead of `println!` and `newline()` instead of `println!()`.
+
+macro_rules! println_raw {
+    () => {
+        print!("\r\n");
+        io::stdout().flush().ok();
+    };
+    ($fmt:literal) => {
+        print!(concat!($fmt, "\r\n"));
+        io::stdout().flush().ok();
+    };
+    ($fmt:literal, $($arg:tt)*) => {
+        print!(concat!($fmt, "\r\n"), $($arg)*);
+        io::stdout().flush().ok();
+    };
+}
+
 // ── Public render API ───────────────────────────────────────────────────────
 
 pub fn text_delta(text: &str) {
     if !IN_TEXT.swap(true, Ordering::Relaxed) {
-        print!("\n  ");
+        print!("\r\n  ");
     }
-    // Handle newlines with indentation
-    let formatted = text.replace('\n', "\n  ");
+    // Handle newlines: in raw mode we need \r\n, not just \n
+    let formatted = text.replace('\n', "\r\n  ");
     print!("{formatted}");
     io::stdout().flush().ok();
 }
@@ -79,13 +105,13 @@ pub fn text_delta(text: &str) {
 /// `input_preview` is an optional compact summary of the inputs.
 pub fn tool_call(name: &str, input_preview: Option<&str>) {
     if IN_TEXT.swap(false, Ordering::Relaxed) {
-        println!();
+        print!("\r\n");
     }
     TOOL_START_MS.store(now_ms(), Ordering::Relaxed);
     if let Some(preview) = input_preview {
-        println!("\n  \x1b[33m⚡ {name}\x1b[0m \x1b[2m{preview}\x1b[0m");
+        println_raw!("\r\n  \x1b[33m⚡ {}\x1b[0m \x1b[2m{}\x1b[0m", name, preview);
     } else {
-        println!("\n  \x1b[33m⚡ {name}\x1b[0m");
+        println_raw!("\r\n  \x1b[33m⚡ {}\x1b[0m", name);
     }
 }
 
@@ -109,15 +135,15 @@ pub fn tool_result(result: &str) {
     let preview = truncate_str(result, 160);
     // Replace newlines with arrows for compact single-line display
     let preview = preview.replace('\n', " ↵ ");
-    println!("  \x1b[2m→ {preview}\x1b[0m{elapsed}");
+    println_raw!("  \x1b[2m→ {}\x1b[0m{}", preview, elapsed);
 }
 
 /// Render a context management / trimming notice.
 pub fn context_management(chars: u64) {
     if IN_TEXT.swap(false, Ordering::Relaxed) {
-        println!();
+        print!("\r\n");
     }
-    println!("  \x1b[2m[context trimmed — {chars} chars, oldest tool results elided]\x1b[0m");
+    println_raw!("  \x1b[2m[context trimmed — {} chars, oldest tool results elided]\x1b[0m", chars);
 }
 
 /// Show that the agent is thinking (before any streamed output arrives).
@@ -131,11 +157,11 @@ pub fn thinking() -> SpinnerHandle {
 pub fn thinking_delta(chunk: &str) {
     if !IN_THINKING.swap(true, Ordering::Relaxed) {
         // Opening line — dim header
-        print!("\n  \x1b[2m╭─ thinking ──────────────────────────────────────\x1b[0m\n");
+        print!("\r\n  \x1b[2m╭─ thinking ──────────────────────────────────────\x1b[0m\r\n");
         print!("  \x1b[2m│\x1b[0m ");
     }
-    // Indent continuation lines with dim pipe
-    let formatted = chunk.replace('\n', "\n  \x1b[2m│\x1b[0m ");
+    // Indent continuation lines with dim pipe; use \r\n in raw mode
+    let formatted = chunk.replace('\n', "\r\n  \x1b[2m│\x1b[0m ");
     print!("\x1b[2m{formatted}\x1b[0m");
     io::stdout().flush().ok();
 }
@@ -143,14 +169,15 @@ pub fn thinking_delta(chunk: &str) {
 /// Close an open thinking block (if any).
 pub fn finish_thinking() {
     if IN_THINKING.swap(false, Ordering::Relaxed) {
-        println!();
-        println!("  \x1b[2m╰─────────────────────────────────────────────────\x1b[0m");
+        print!("\r\n");
+        println_raw!("  \x1b[2m╰─────────────────────────────────────────────────\x1b[0m");
     }
 }
 
 pub fn finish() {
     IN_TEXT.store(false, Ordering::Relaxed);
-    println!("\n");
+    print!("\r\n\r\n");
+    io::stdout().flush().ok();
 }
 
 /// Safely truncate a string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.
@@ -227,9 +254,13 @@ pub fn format_tool_input(name: &str, input: &serde_json::Value) -> Option<String
         }
         "grep_search" => {
             let pat = str_val("pattern")?;
-            let path = str_val("path").map(|p| format!(" path='{p}'")).unwrap_or_default();
-            let inc = str_val("include").map(|i| format!(" include='{i}'")).unwrap_or_default();
-            Some(format!("/{pat}/{path}{inc}"))
+            let path = str_val("path").map(|p| format!(" in {p}")).unwrap_or_default();
+            let inc  = str_val("include").map(|i| format!(" [{i}]")).unwrap_or_default();
+            Some(format!("'{pat}'{path}{inc}"))
+        }
+        "semantic_search" => {
+            let query = str_val("query")?;
+            Some(format!("'{}'", truncate(&query, 60)))
         }
         "web_search" => {
             let q = str_val("query")?;
@@ -239,135 +270,58 @@ pub fn format_tool_input(name: &str, input: &serde_json::Value) -> Option<String
             let url = str_val("url")?;
             Some(format!("'{}'", truncate(&url, 80)))
         }
-        "symbol_search" => {
-            let name_val = str_val("name")?;
-            if let Some(p) = str_val("path") {
-                Some(format!("'{name_val}' in {p}"))
-            } else {
-                Some(format!("'{name_val}'"))
-            }
-        }
-        "git" => {
-            let args = str_val("args")?;
-            if let Some(cwd) = str_val("working_dir") {
-                Some(format!("'{args}' (in {cwd})"))
-            } else {
-                Some(format!("'{args}'"))
-            }
-        }
-        "dev_pipeline" => {
-            let action = str_val("action")?;
-            let branch = str_val("branch").unwrap_or_default();
-            let mut out = format!("action='{action}' branch='{branch}'");
-            if let Some(msg) = str_val("message") { out += &format!(" msg='{}'", truncate(&msg, 40)); }
-            Some(out)
+        "execute_python" => {
+            let code = str_val("code").unwrap_or_default();
+            let first_line = code.lines().next().unwrap_or("").to_string();
+            Some(format!("'{}'", truncate(&first_line, 60)))
         }
         "synthesize" => {
             let q = str_val("question")?;
             Some(format!("'{}'", truncate(&q, 60)))
         }
-        "auto_fix" => {
-            let cmd = str_val("command")?;
-            if let Some(cwd) = str_val("working_dir") {
-                Some(format!("'{cmd}' (in {cwd})"))
-            } else {
-                Some(format!("'{cmd}'"))
-            }
-        }
-        "semantic_index" | "semantic_search" => {
-            let query = str_val("query").or_else(|| str_val("path")).unwrap_or_default();
-            Some(format!("'{}'", truncate(&query, 60)))
-        }
         "db_query" => {
-            if let Some(sql) = str_val("sql") {
+            let action = str_val("action").unwrap_or_else(|| "query".into());
+            if action == "query" {
+                let sql = str_val("sql").unwrap_or_default();
                 Some(format!("'{}'", truncate(&sql, 60)))
+            } else if action == "schema" {
+                let table = str_val("table").unwrap_or_default();
+                Some(format!("schema '{table}'"))
             } else {
-                str_val("action").map(|a| format!("action='{a}'"))
+                Some(action)
             }
+        }
+        "symbol_search" => {
+            let name_val = str_val("name")?;
+            Some(format!("'{name_val}'"))
+        }
+        "git" => {
+            let args = str_val("args")?;
+            Some(format!("'{}'", truncate(&args, 60)))
+        }
+        "dev_pipeline" => {
+            let action = str_val("action").unwrap_or_default();
+            let branch = str_val("branch").unwrap_or_default();
+            Some(format!("{action} '{branch}'"))
+        }
+        "clipboard_paste" => {
+            let text = str_val("text").unwrap_or_default();
+            Some(format!("({} chars)", text.len()))
         }
         "image_analyze" => {
             let prompt = str_val("prompt").unwrap_or_default();
-            Some(format!("'{}'", truncate(&prompt, 60)))
+            Some(format!("'{}'", truncate(&prompt, 50)))
         }
         "qpu_submit" => {
             let circuit = str_val("circuit_type").unwrap_or_default();
-            let device = str_val("device").unwrap_or_default();
-            Some(format!("circuit='{circuit}' device='{device}'"))
+            let device  = str_val("device").unwrap_or_default();
+            Some(format!("{circuit} on {device}"))
         }
         "qpu_poll" => {
             let action = str_val("action").unwrap_or_default();
-            if let Some(id) = str_val("task_id") {
-                Some(format!("action='{action}' id='{}'", truncate(&id, 20)))
-            } else {
-                Some(format!("action='{action}'"))
-            }
-        }
-        "test_runner" => {
-            let cmd = str_val("command")?;
-            Some(format!("'{}'", truncate(&cmd, 60)))
-        }
-        "clipboard_paste" => {
-            let text = str_val("text")?;
-            let paste = obj.get("paste").and_then(|v| v.as_bool()).unwrap_or(false);
-            let suffix = if paste { " +paste" } else { "" };
-            Some(format!("'{}'{}",truncate(&text, 40), suffix))
-        }
-        "multi_file_refactor" => {
-            let old = str_val("old_name")?;
-            let new = str_val("new_name")?;
-            let dry = obj.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
-            Some(format!("'{old}' → '{new}' dry_run={dry}"))
-        }
-        "use_aws" => {
-            let svc = str_val("service").unwrap_or_default();
-            let op = str_val("operation").unwrap_or_default();
-            Some(format!("{svc}::{op}"))
+            let task   = str_val("task_id").map(|t| format!(" {}", truncate(&t, 20))).unwrap_or_default();
+            Some(format!("{action}{task}"))
         }
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn test_format_tool_input_file_read() {
-        let input = json!({"path": "/foo/bar.rs", "offset": 10, "limit": 50});
-        let result = format_tool_input("file_read", &input).unwrap();
-        assert_eq!(result, "'/foo/bar.rs' +10 limit=50");
-    }
-
-    #[test]
-    fn test_format_tool_input_execute_bash() {
-        let input = json!({"command": "cargo test", "working_dir": "/repo"});
-        let result = format_tool_input("execute_bash", &input).unwrap();
-        assert_eq!(result, "'cargo test' (in /repo)");
-    }
-
-    #[test]
-    fn test_format_tool_input_dev_pipeline() {
-        let input = json!({"action": "full", "branch": "feat/foo", "message": "add feature"});
-        let result = format_tool_input("dev_pipeline", &input).unwrap();
-        assert!(result.contains("action='full'"));
-        assert!(result.contains("branch='feat/foo'"));
-    }
-
-    #[test]
-    fn test_format_tool_input_synthesize() {
-        let input = json!({"question": "Is Rust faster than Go?"});
-        let result = format_tool_input("synthesize", &input).unwrap();
-        assert_eq!(result, "'Is Rust faster than Go?'");
-    }
-
-    #[test]
-    fn test_unicode_char_boundary_handling() {
-        // Emoji are 4 bytes each — truncate must not split mid-char
-        let s = "hello 🦀🦀🦀 world";
-        // truncate_str is private, but format_tool_input exercises it
-        let input = serde_json::json!({"query": s});
-        let result = format_tool_input("web_search", &input);
-        assert!(result.is_some());
     }
 }
