@@ -41,12 +41,11 @@ impl SpinnerHandle {
 impl Drop for SpinnerHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Detach rather than join — joining blocks the caller (especially bad
-        // when dropped inside a tokio::select! cancel branch on an async
-        // executor thread).  The spinner thread checks the flag every 80ms
-        // and will exit + clear its line on its own.
+        // Join with a short timeout — the thread checks the flag every 80ms
+        // so it will exit within one tick. Joining prevents output races where
+        // the spinner's clear-line escape overlaps with new render output.
         if let Some(t) = self.thread.take() {
-            drop(t); // detach
+            let _ = t.join();
         }
     }
 }
@@ -144,6 +143,14 @@ pub fn context_management(chars: u64) {
         print!("\r\n");
     }
     println_raw!("  \x1b[2m[context trimmed — {} chars, oldest tool results elided]\x1b[0m", chars);
+}
+
+/// Show iteration progress (agent loop count).
+pub fn iteration_progress(current: u64, max: u64) {
+    if IN_TEXT.swap(false, Ordering::Relaxed) {
+        print!("\r\n");
+    }
+    println_raw!("  \x1b[2m[iteration {}/{}]\x1b[0m", current, max);
 }
 
 /// Show that the agent is thinking (before any streamed output arrives).

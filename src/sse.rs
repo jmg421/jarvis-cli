@@ -42,6 +42,9 @@ struct RunRequest<'a> {
     /// Extended-thinking token budget (None = use backend default / no extended thinking)
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_tokens: Option<u32>,
+    /// Client working directory for relative path resolution
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +75,11 @@ struct SseEvent {
     // done
     #[serde(default)]
     iterations: Option<u64>,
+    // iteration progress
+    #[serde(default)]
+    current: Option<u64>,
+    #[serde(default)]
+    max: Option<u64>,
 }
 
 /// Sentinel error string returned when the caller cancels via the watch channel.
@@ -101,7 +109,7 @@ pub async fn stream(
     // start checking cancel *after* the connection was established.
     let connect_fut = client
         .post(format!("{url}/stream"))
-        .json(&RunRequest { prompt, session_id, api_key, budget_tokens })
+        .json(&RunRequest { prompt, session_id, api_key, budget_tokens, cwd: Some(std::env::current_dir().unwrap_or_default().to_string_lossy().into_owned()) })
         .header("Accept", "text/event-stream")
         .send();
 
@@ -211,6 +219,11 @@ pub async fn stream(
                             "context_management" => {
                                 let chars = event.chars_removed.unwrap_or(0);
                                 render::context_management(chars);
+                            }
+                            "iteration" => {
+                                if let (Some(cur), Some(max)) = (event.current, event.max) {
+                                    render::iteration_progress(cur, max);
+                                }
                             }
                             "done" => {
                                 drop(spinner.take());

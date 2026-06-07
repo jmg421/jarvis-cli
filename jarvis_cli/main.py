@@ -2102,6 +2102,56 @@ def daemon_mode():
         DAEMON_PID_FILE.unlink(missing_ok=True)
 
 
+def quantum_test_prioritize_cmd(project_path, use_qpu=False, max_select=5, shots=100):
+    """Run quantum test prioritization."""
+    sys.path.insert(0, str(AGENT_BACKEND))
+    try:
+        from jarvis_agent.executor import _quantum_test_prioritize
+    except ImportError as e:
+        print(f"  {YELLOW}❌ Cannot import quantum tools: {e}{RESET}")
+        return
+    
+    print(f"\n  {CYAN}🔬 QUANTUM TEST PRIORITIZATION{RESET}")
+    print(f"  {DIM}Project: {project_path}{RESET}")
+    print(f"  {DIM}Device: {'QuEra Aquila QPU' if use_qpu else 'Local Simulator'}{RESET}")
+    print(f"  {DIM}Max select: {max_select} tests{RESET}\n")
+    
+    result = _quantum_test_prioritize({
+        "project_path": project_path,
+        "use_qpu": use_qpu,
+        "max_select": max_select,
+        "shots": shots,
+    })
+    
+    print(result)
+
+
+def quantum_device_compat_cmd(frontend_path=None, use_qpu=False, shots=200):
+    """Run quantum device compatibility optimization."""
+    sys.path.insert(0, str(AGENT_BACKEND))
+    try:
+        from jarvis_agent.executor import _quantum_device_compat
+    except ImportError as e:
+        print(f"  {YELLOW}❌ Cannot import quantum tools: {e}{RESET}")
+        return
+    
+    print(f"\n  {CYAN}📱 QUANTUM DEVICE COMPATIBILITY{RESET}")
+    if frontend_path:
+        print(f"  {DIM}Frontend: {frontend_path} (auto-extract){RESET}")
+    else:
+        print(f"  {DIM}Using nodes-bio defaults{RESET}")
+    print(f"  {DIM}Device: {'QuEra Aquila QPU' if use_qpu else 'Classical MIS'}{RESET}\n")
+    
+    result = _quantum_device_compat({
+        "frontend_path": frontend_path,
+        "use_qpu": use_qpu,
+        "shots": shots,
+        "output_css": True,
+    })
+    
+    print(result)
+
+
 def main():
     """Main entry point with improved signal handling."""
     try:
@@ -2127,6 +2177,26 @@ def main():
             clear_queue()
         elif args[0] == "--replay":
             replay_last_task()
+        elif args[0] == "--quantum-test":
+            if len(args) < 2:
+                print(f"  {YELLOW}Usage: jarvis-cli --quantum-test <project_path> [--qpu] [--max-select N]{RESET}")
+                return
+            project_path = args[1]
+            use_qpu = "--qpu" in args
+            max_select = 5
+            if "--max-select" in args:
+                idx = args.index("--max-select")
+                if idx + 1 < len(args):
+                    try:
+                        max_select = int(args[idx + 1])
+                    except ValueError:
+                        print(f"  {YELLOW}Invalid --max-select value{RESET}")
+                        return
+            quantum_test_prioritize_cmd(project_path, use_qpu=use_qpu, max_select=max_select)
+        elif args[0] == "--quantum-device":
+            frontend_path = args[1] if len(args) > 1 and not args[1].startswith("--") else None
+            use_qpu = "--qpu" in args
+            quantum_device_compat_cmd(frontend_path=frontend_path, use_qpu=use_qpu)
         elif args[0] == "--enqueue":
             if len(args) < 2:
                 print(f"  {YELLOW}Usage: jarvis-cli --enqueue \"task description\"{RESET}")
@@ -2195,6 +2265,34 @@ def main():
             result = _run_local(prompt, api_key, sid)
             if result:
                 print(f"\n  {DIM}session: {result.get('session_id', sid)}{RESET}")
+        elif args[0] == "--quantum-test":
+            if len(args) < 2:
+                print(f"  {YELLOW}Usage: jarvis-cli --quantum-test <project_path> [--qpu] [--max-select N]{RESET}")
+                return
+            from jarvis_cli.quantum_commands import quantum_test_prioritize_cli
+            use_qpu = "--qpu" in args
+            max_select = 5
+            for i, arg in enumerate(args):
+                if arg == "--max-select" and i + 1 < len(args):
+                    try:
+                        max_select = int(args[i + 1])
+                    except ValueError:
+                        print(f"  {YELLOW}Invalid --max-select value{RESET}")
+                        return
+            project_path = args[1]
+            quantum_test_prioritize_cli(project_path, use_qpu, max_select)
+        elif args[0] == "--quantum-device":
+            if len(args) < 2:
+                print(f"  {YELLOW}Usage: jarvis-cli --quantum-device <frontend_path> [--qpu] [--config config.json]{RESET}")
+                return
+            from jarvis_cli.quantum_commands import quantum_device_compat_cli
+            use_qpu = "--qpu" in args
+            component_config = None
+            for i, arg in enumerate(args):
+                if arg == "--config" and i + 1 < len(args):
+                    component_config = args[i + 1]
+            frontend_path = args[1]
+            quantum_device_compat_cli(frontend_path, use_qpu, component_config)
         else:
             # One-shot
             import urllib.request

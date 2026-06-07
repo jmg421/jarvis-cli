@@ -1,5 +1,5 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, EnableBracketedPaste, DisableBracketedPaste},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, EnableBracketedPaste, DisableBracketedPaste, DisableMouseCapture},
     terminal::{disable_raw_mode, enable_raw_mode},
     execute,
 };
@@ -632,7 +632,7 @@ fn print_cost(usage: &Usage) {
 /// correctly (\n resets to column 0).
 fn read_input(history: &[String]) -> Option<String> {
     enable_raw_mode().ok();
-    execute!(io::stdout(), EnableBracketedPaste).ok();
+    execute!(io::stdout(), EnableBracketedPaste, DisableMouseCapture).ok();
 
     print!("  \x1b[32m❯\x1b[0m ");
     io::stdout().flush().ok();
