@@ -1,7 +1,6 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, EnableBracketedPaste, DisableBracketedPaste, DisableMouseCapture},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode},
-    execute,
 };
 use std::fs;
 use std::io::{self, Write};
@@ -391,10 +390,10 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
         // calls finish_thinking() + finish() from *inside* the loop, and
         // returns Err(CANCELLED).  This avoids all races between the spinner
         // thread cleanup and the cancel branch printing.
-        // Enable raw mode for the duration of streaming so that the
-        // key_watcher spawn_blocking thread receives Esc/Ctrl-C events
-        // directly instead of having them swallowed by the OS line discipline.
-        enable_raw_mode().ok();
+        // Enable raw mode via StreamingGuard (RAII) so that the key_watcher
+        // spawn_blocking thread receives Esc/Ctrl-C events directly.
+        let _streaming_guard = crate::terminal::StreamingGuard::enter()
+            .expect("terminal already in raw/streaming state");
 
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
@@ -468,9 +467,8 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
         stream_done.store(true, std::sync::atomic::Ordering::Release);
         let _ = watcher_handle.await;
 
-        // Back to cooked mode — all response/command output uses println!
-        // which emits \n (not \r\n), so cooked mode is required.
-        disable_raw_mode().ok();
+        // Drop the streaming guard → restores cooked mode.
+        drop(_streaming_guard);
 
         match stream_result {
             Ok((new_session_id, usage, assistant_text)) => {
@@ -516,11 +514,9 @@ pub async fn run(url: String, session_id: Option<String>, no_daemon: bool) {
     }
 
     // ── Restore terminal on clean exit ──────────────────────────────────────
-    // Raw mode and bracketed paste are only held during read_input() and
-    // during streaming — both are always cleaned up on their own paths.
-    // Call disable here defensively in case of an early break mid-stream.
-    let _ = execute!(io::stdout(), DisableBracketedPaste);
-    disable_raw_mode().ok();
+    // The guards handle cleanup automatically, but call force_restore
+    // defensively in case of an early break mid-stream.
+    crate::terminal::force_restore();
     println!("\n  \x1b[2mGoodbye.\x1b[0m\n");
 }
 
@@ -627,20 +623,19 @@ fn print_cost(usage: &Usage) {
 
 /// Read one line of input from the user.
 ///
-/// Enables raw mode + bracketed paste just for the duration of the read,
-/// then restores cooked mode so that subsequent println! output works
-/// correctly (\n resets to column 0).
+/// Uses a RawInputGuard RAII pattern — raw mode + bracketed paste are
+/// automatically restored to cooked mode when the guard drops, even on panic.
 fn read_input(history: &[String]) -> Option<String> {
-    enable_raw_mode().ok();
-    execute!(io::stdout(), EnableBracketedPaste, DisableMouseCapture).ok();
+    let _guard = crate::terminal::RawInputGuard::enter()
+        .expect("terminal already in raw/streaming state");
 
     print!("  \x1b[32m❯\x1b[0m ");
     io::stdout().flush().ok();
 
     let result = read_input_raw(history);
 
-    execute!(io::stdout(), DisableBracketedPaste).ok();
-    disable_raw_mode().ok();
+    // Guard drops here → disables bracketed paste + raw mode
+    drop(_guard);
     // In cooked mode \n does CR+LF, but we're transitioning from raw where
     // the cursor is still on the input line — print \r\n to move cleanly.
     print!("\r\n");

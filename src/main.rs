@@ -2,10 +2,10 @@ mod daemon;
 mod queue;
 mod render;
 mod sse;
+pub mod terminal;
 mod tui;
 
 use clap::Parser;
-use crossterm;
 
 #[derive(Parser)]
 #[command(name = "jarvis", about = "Agentic development CLI — introspect • synthesize • build")]
@@ -137,11 +137,7 @@ async fn main() {
     // leaves the terminal in raw mode — the shell becomes unusable.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::event::DisableBracketedPaste
-        );
+        terminal::force_restore();
         default_hook(info);
     }));
 
