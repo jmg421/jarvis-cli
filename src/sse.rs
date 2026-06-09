@@ -157,14 +157,14 @@ pub async fn stream(
                 render::finish();
                 return Err(CANCELLED.to_string());
             }
-            result = timeout(Duration::from_secs(180), stream.next()) => {
+            result = timeout(Duration::from_secs(600), stream.next()) => {
                 match result {
                     Ok(Some(c)) => c,
                     Ok(None) => break,
                     Err(_) => {
                         drop(spinner.take());
                         render::finish();
-                        return Err("Stream timeout: no data for 180s".to_string());
+                        return Err("Stream timeout: no data for 600s".to_string());
                     }
                 }
             }
@@ -223,6 +223,10 @@ pub async fn stream(
                             "iteration" => {
                                 if let (Some(cur), Some(max)) = (event.current, event.max) {
                                     render::iteration_progress(cur, max);
+                                }
+                                // Re-show spinner while waiting for next model response
+                                if spinner.is_none() {
+                                    spinner = Some(render::thinking());
                                 }
                             }
                             "done" => {

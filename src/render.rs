@@ -17,6 +17,7 @@ pub struct SpinnerHandle {
 
 impl SpinnerHandle {
     /// Spawn a spinner that keeps printing until dropped.
+    /// Shows elapsed time after 5 seconds so user knows it's not frozen.
     pub fn start(label: &str) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
@@ -24,8 +25,14 @@ impl SpinnerHandle {
         let thread = std::thread::spawn(move || {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let mut i = 0usize;
+            let started = std::time::Instant::now();
             while !stop2.load(Ordering::Relaxed) {
-                print!("\r  \x1b[2m{} {}\x1b[0m  ", frames[i % frames.len()], label);
+                let elapsed = started.elapsed().as_secs();
+                if elapsed >= 5 {
+                    print!("\r  \x1b[2m{} {} ({}s)\x1b[0m  ", frames[i % frames.len()], label, elapsed);
+                } else {
+                    print!("\r  \x1b[2m{} {}\x1b[0m  ", frames[i % frames.len()], label);
+                }
                 io::stdout().flush().ok();
                 i += 1;
                 std::thread::sleep(Duration::from_millis(80));
